@@ -7,11 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define HASHN       3    // number of multiplies in hash
-#define SHIFT_RANGE 1    // radius of shift search
+#define HASHN       2    // number of multiplies in hash
+#define SHIFT_RANGE 2    // radius of shift search
 #define CONST_RANGE 2    // radius of const search
 #define QUALITY     18   // 2^N iterations of estimate samples
 #define THRESHOLD   1.95 // regenerate anything lower than this estimate
+// #define THRESHOLD   0.08 // regenerate anything lower than this estimate
 
 static int optind = 1;
 static int opterr = 1;
@@ -110,7 +111,7 @@ rand64(uint64_t s[4])
 }
 
 struct hash {
-    uint32_t c[HASHN];
+    uint64_t c[HASHN];
     char s[HASHN + 1];
 };
 
@@ -118,9 +119,9 @@ static void
 hash_gen(struct hash *h, uint64_t rng[4])
 {
     for (int i = 0; i < HASHN; i++)
-        h->c[i] = (rand64(rng) >> 32) | 1u;
+        h->c[i] = rand64(rng) | 1ULL;
     for (int i = 0; i <= HASHN; i++)
-        h->s[i] = 16;
+        h->s[i] = 32;
 }
 
 static int
@@ -140,7 +141,7 @@ hash_print(const struct hash *h)
 {
     putchar('[');
     for (int i = 0; i < HASHN; i++)
-        printf("%2d %08lx ", h->s[i], (unsigned long)h->c[i]);
+        printf("%2d %016llx ", h->s[i], (unsigned long long)h->c[i]);
     printf("%2d]", h->s[HASHN]);
     fflush(stdout);
 }
@@ -149,7 +150,7 @@ static int
 hash_parse(struct hash *h, char *str)
 {
     long s;
-    unsigned long c;
+    unsigned long long c;
     char *end, *tok;
     if (*str != '[')
         return 0;
@@ -157,25 +158,25 @@ hash_parse(struct hash *h, char *str)
     for (int i = 0; i < HASHN; i++) {
         tok = strtok(i ? 0 : str, " ");
         s = strtol(tok, &end, 10);
-        if (s < 1 || s > 31 || !(*end == 0 || *end == ' '))
+        if (s < 1 || s > 63 || !(*end == 0 || *end == ' '))
             return 0;
         h->s[i] = s;
         tok = strtok(0, " ");
-        c = strtoul(tok, &end, 16);
-        if (c > 0xffffffffUL || !(*end == 0 || *end == ' '))
+        c = strtoull(tok, &end, 16);
+        if (c > 0xffffffffffffffffULL || !(*end == 0 || *end == ' '))
             return 0;
         h->c[i] = c;
     }
     tok = strtok(0, "]");
     s = strtol(tok, &end, 10);
-    if (s < 1 || s > 31 || *end)
+    if (s < 1 || s > 63 || *end)
         return 0;
     h->s[HASHN] = s;
     return 1;
 }
 
-static uint32_t
-hash(const struct hash *h, uint32_t x)
+static uint64_t
+hash(const struct hash *h, uint64_t x)
 {
     for (int i = 0; i < HASHN; i++) {
         x ^= x >> h->s[i];
@@ -186,61 +187,87 @@ hash(const struct hash *h, uint32_t x)
 }
 
 static double
-estimate_bias32(const struct hash *f, uint64_t rng[4])
+estimate_bias64(const struct hash *f, uint64_t rng[4])
 {
     long n = 1L << QUALITY;
-    long bins[32][32] = {{0}};
+    long bins[64][64] = {{0}};
     for (long i = 0; i < n; i++) {
-        uint32_t x = rand64(rng);
-        uint32_t h0 = hash(f, x);
-        for (int j = 0; j < 32; j++) {
-            uint32_t bit = UINT32_C(1) << j;
-            uint32_t h1 = hash(f, x ^ bit);
-            uint32_t set = h0 ^ h1;
-            for (int k = 0; k < 32; k++)
+        uint64_t x = rand64(rng);
+        uint64_t h0 = hash(f, x);
+        for (int j = 0; j < 64; j++) {
+            uint64_t bit = UINT64_C(1) << j;
+            uint64_t h1 = hash(f, x ^ bit);
+            uint64_t set = h0 ^ h1;
+            for (int k = 0; k < 64; k++)
                 bins[j][k] += (set >> k) & 1;
         }
     }
     double mean = 0;
-    for (int j = 0; j < 32; j++) {
-        for (int k = 0; k < 32; k++) {
+    for (int j = 0; j < 64; j++) {
+        for (int k = 0; k < 64; k++) {
             double diff = (bins[j][k] - n / 2) / (n / 2.0);
-            mean += (diff * diff) / (32 * 32);
+            mean += (diff * diff) / (64 * 64);
         }
     }
     return sqrt(mean) * 1000.0;
 }
 
-#define EXACT_SPLIT 32  // must be power of two
+
+/**
+ * Use splitmix to ensure that we're not re-exploring the same values while we do
+ * a larger estimation check.  Splitmix is a permutation, so there will be no collisions
+ * for different inputs.
+ */
+static uint64_t
+splitmix64(uint64_t z)
+{
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+
+#define DEEPER_SPLIT 32  // must be power of two
+#define DEEPER_QUALITY 32
+
 static double
-exact_bias32(const struct hash *f)
+deeper_bias64(const struct hash *f, int quality)
 {
     int i; // declare here to work around Visual Studio issue
-    long long bins[32][32] = {{0}};
-    static const uint64_t range = (UINT64_C(1) << 32) / EXACT_SPLIT;
+    long long bins[64][64] = {{0}};
+    /**
+     * We can't explare all 2^64 inputs, so we'll explore 2^32 of them, parallelizable
+     * across DEEPER_SPLIT threads.
+     */
+    const uint64_t range = (1ULL << (quality)) / DEEPER_SPLIT;
     #pragma omp parallel for
-    for (i = 0; i < EXACT_SPLIT; i++) {
-        long long b[32][32] = {{0}};
-        for (uint64_t x = i * range; x < (i + 1) * range; x++) {
-            uint32_t h0 = hash(f, x);
-            for (int j = 0; j < 32; j++) {
-                uint32_t bit = UINT32_C(1) << j;
-                uint32_t h1 = hash(f, x ^ bit);
-                uint32_t set = h0 ^ h1;
-                for (int k = 0; k < 32; k++)
+    for (i = 0; i < DEEPER_SPLIT; i++) {
+        long long b[64][64] = {{0}};
+        uint64_t start = (uint64_t)i * range;
+        uint64_t end = start + range - 1;
+        for (uint64_t idx = start; idx <= end; idx++) {
+            uint64_t x = splitmix64(idx);
+            uint64_t h0 = hash(f, x);
+            for (int j = 0; j < 64; j++) {
+                uint64_t bit = UINT64_C(1) << j;
+                uint64_t h1 = hash(f, x ^ bit);
+                uint64_t set = h0 ^ h1;
+                for (int k = 0; k < 64; k++)
                     b[j][k] += (set >> k) & 1;
             }
         }
         #pragma omp critical
-        for (int j = 0; j < 32; j++)
-            for (int k = 0; k < 32; k++)
+        for (int j = 0; j < 64; j++)
+            for (int k = 0; k < 64; k++)
                 bins[j][k] += b[j][k];
     }
+    const long long expected_value = (range * DEEPER_SPLIT) / 2;
     double mean = 0.0;
-    for (int j = 0; j < 32; j++) {
-        for (int k = 0; k < 32; k++) {
-            double diff = (bins[j][k] - 2147483648L) / 2147483648.0;
-            mean += (diff * diff) / (32 * 32);
+    for (int j = 0; j < 64; j++) {
+        for (int k = 0; k < 64; k++) {
+            /* Normalize by expected value first to keep numbers near 1.0 */
+            double diff = (bins[j][k] - expected_value) / (double)expected_value;
+            mean += (diff * diff) / (64 * 64);
         }
     }
     return sqrt(mean) * 1000.0;
@@ -249,9 +276,12 @@ exact_bias32(const struct hash *f)
 static void
 hash_gen_strict(struct hash *h, uint64_t rng[4])
 {
-    do
+    double bias = THRESHOLD + 1;
+    do {
         hash_gen(h, rng);
-    while (estimate_bias32(h, rng) > THRESHOLD);
+        bias = estimate_bias64(h, rng);
+        printf("generated bias %.17g\n", bias);
+    } while ( bias > THRESHOLD);
 }
 
 static uint64_t
@@ -316,16 +346,17 @@ rng_init(uint64_t rng[4])
     mix64x4(rng);
 }
 
-/* Modular multiplicative inverse (32-bit) */
-static uint32_t
-modinv32(uint32_t x)
+/* Modular multiplicative inverse (64-bit) */
+static uint64_t
+modinv64(uint64_t x)
 {
-    uint32_t a = x;
+    uint64_t a = x;
     x += x - a * x * x;
     x += x - a * x * x;
     x += x - a * x * x;
     x += x - a * x * x;
     x += x - a * x * x;
+    x += x - a * x * x;  // 6 iterations for 64-bit
     return x;
 }
 
@@ -407,20 +438,20 @@ main(int argc, char **argv)
             fprintf(stderr, "hillclimb: -I requires -p\n");
             exit(EXIT_FAILURE);
         }
-        printf("uint32_t\nhash_r(uint32_t x)\n{\n");
+        printf("uint64_t\nhash_r(uint64_t x)\n{\n");
         for (int i = 0; i < HASHN * 2 + 1; i++) {
             switch (i & 1) {
                 case 0: {
                     int s = HASHN - i / 2;
                     printf("    x ^=");
-                    for (int i = cur.s[s]; i < 32; i += cur.s[s])
+                    for (int i = cur.s[s]; i < 64; i += cur.s[s])
                         printf(" %sx >> %d", i == cur.s[s] ? "" : "^ ", i);
                     printf(";\n");
                 } break;
                 case 1: {
                     int c = HASHN - (i + 1) / 2;
-                    unsigned long inv = modinv32(cur.c[c]);
-                    printf("    x *= 0x%08lx;\n", inv);
+                    unsigned long long inv = modinv64(cur.c[c]);
+                    printf("    x *= 0x%016llx;\n", inv);
                 } break;
             }
         }
@@ -434,7 +465,7 @@ main(int argc, char **argv)
             exit(EXIT_FAILURE);
         }
         hash_print(&cur);
-        printf(" = %.17g\n", exact_bias32(&cur));
+        printf(" = %.17g\n", deeper_bias64(&cur, DEEPER_QUALITY));
         exit(EXIT_SUCCESS);
     }
 
@@ -452,7 +483,7 @@ main(int argc, char **argv)
         if (quiet < 2)
             hash_print(&cur);
         if (cur_score < 0)
-            cur_score = exact_bias32(&cur);
+            cur_score = deeper_bias64(&cur, DEEPER_QUALITY);
         if (quiet < 2)
             printf(" = %.17g\n", cur_score);
 
@@ -461,7 +492,7 @@ main(int argc, char **argv)
 
         /* Explore around shifts */
         for (int i = 0; i <= HASHN; i++) {
-            /* In theory the shift could drift above 31 or below 1, but
+            /* In theory the shift could drift above 63 or below 1, but
              * in practice it would never get this far since these would
              * be terrible hashes.
              */
@@ -474,7 +505,7 @@ main(int argc, char **argv)
                     printf("  ");
                     hash_print(&tmp);
                 }
-                double score = exact_bias32(&tmp);
+                double score = deeper_bias64(&tmp, DEEPER_QUALITY);
                 if (quiet <= 0)
                     printf(" = %.17g\n", score);
                 if (score < best_score) {
@@ -496,7 +527,7 @@ main(int argc, char **argv)
                     printf("  ");
                     hash_print(&tmp);
                 }
-                double score = exact_bias32(&tmp);
+                double score = deeper_bias64(&tmp, DEEPER_QUALITY);
                 if (quiet <= 0)
                     printf(" = %.17g\n", score);
                 if (score < best_score) {

@@ -230,13 +230,19 @@ splitmix64(uint64_t z)
 #define DEEPER_SPLIT 32  // must be power of two
 #define DEEPER_QUALITY 32
 
-static double
+struct deeper_bias_result {
+    double rms_deviation;
+    double max_bias_95_conf_min;
+    double max_bias_95_conf_max;
+};
+
+static struct deeper_bias_result
 deeper_bias64(const struct hash *f, int quality)
 {
     int i; // declare here to work around Visual Studio issue
     long long bins[64][64] = {{0}};
     /**
-     * We can't explare all 2^64 inputs, so we'll explore 2^32 of them, parallelizable
+     * We can't explore all 2^64 inputs, so we'll explore 2^quality of them, parallelizable
      * across DEEPER_SPLIT threads.
      */
     const uint64_t range = (1ULL << (quality)) / DEEPER_SPLIT;
@@ -261,16 +267,50 @@ deeper_bias64(const struct hash *f, int quality)
             for (int k = 0; k < 64; k++)
                 bins[j][k] += b[j][k];
     }
-    const long long expected_value = (range * DEEPER_SPLIT) / 2;
-    double mean = 0.0;
+    const long long expected_value = (1ULL << quality) / 2;
+    double deviation_ratio_sq = 0.0;
+    double max_deviation = 0.0;
     for (int j = 0; j < 64; j++) {
         for (int k = 0; k < 64; k++) {
+            double deviation = bins[j][k] - expected_value;
+            /* Max bias statistic */
+            max_deviation = fmax(max_deviation, fabs(deviation));
             /* Normalize by expected value first to keep numbers near 1.0 */
-            double diff = (bins[j][k] - expected_value) / (double)expected_value;
-            mean += (diff * diff) / (64 * 64);
+            double diff = deviation / (double)expected_value;
+            deviation_ratio_sq += (diff * diff) / (64 * 64);
         }
     }
-    return sqrt(mean) * 1000.0;
+    
+    // With 64*64 trials, the 95% confidence interval for the null hypothesis is
+    //   for maximum deviation is SD * qnorm((1 + 0.95^(1/4096)) / 2) = SD * 4.3683
+    //   SD for unbiased binmonial is sqrt(n) / 2
+    const double sd = sqrt(1ULL << quality) / 2.0;
+    const double deviation_confidence_interval = 1.96 * sd;
+
+    // Only report the variance confidence interval if the maximum deviation exceeds 
+    //    the null hypothesis boundary
+    struct deeper_bias_result result;
+    if (max_deviation > 4.3683 * sd) {
+        result.max_bias_95_conf_min = (max_deviation - deviation_confidence_interval) / expected_value;
+        result.max_bias_95_conf_max = (max_deviation + deviation_confidence_interval) / expected_value;
+    } else {
+        result.max_bias_95_conf_min = 0.0;
+        result.max_bias_95_conf_max = (4.3683 * sd) / expected_value;
+    }
+
+    result.rms_deviation = sqrt(deviation_ratio_sq)* 1000.0;
+    return result;
+}
+
+static void 
+bias_result_print(const char * prefix, struct deeper_bias_result res, const char *suffix)
+{
+    printf("%s[%.17g%% - %.17g%%] %.17g %s",
+                prefix,
+                res.max_bias_95_conf_min * 100.0,
+                res.max_bias_95_conf_max * 100.0, 
+                res.rms_deviation,
+                suffix);
 }
 
 static void
@@ -384,7 +424,7 @@ main(int argc, char **argv)
     int quiet = 0;
     int invert = 0;
     int evaluate = 0;
-    double cur_score = -1;
+    struct deeper_bias_result cur_score = {-1.0, 0.0, 0.0};
 
     int option;
     while ((option = getopt(argc, argv, "EhIp:qsx:")) != -1) {
@@ -465,7 +505,7 @@ main(int argc, char **argv)
             exit(EXIT_FAILURE);
         }
         hash_print(&cur);
-        printf(" = %.17g\n", deeper_bias64(&cur, DEEPER_QUALITY));
+        bias_result_print("", deeper_bias64(&cur, DEEPER_QUALITY), "\n");
         exit(EXIT_SUCCESS);
     }
 
@@ -478,14 +518,15 @@ main(int argc, char **argv)
     for (;;) {
         int found = 0;
         struct hash best;
-        double best_score;
+        struct deeper_bias_result best_score;
 
         if (quiet < 2)
             hash_print(&cur);
-        if (cur_score < 0)
+        if (cur_score.rms_deviation < 0)
             cur_score = deeper_bias64(&cur, DEEPER_QUALITY);
-        if (quiet < 2)
-            printf(" = %.17g\n", cur_score);
+        if (quiet < 2) {
+            bias_result_print(" = ", cur_score, "\n");
+        }
 
         best = cur;
         best_score = cur_score;
@@ -505,10 +546,11 @@ main(int argc, char **argv)
                     printf("  ");
                     hash_print(&tmp);
                 }
-                double score = deeper_bias64(&tmp, DEEPER_QUALITY);
-                if (quiet <= 0)
-                    printf(" = %.17g\n", score);
-                if (score < best_score) {
+                struct deeper_bias_result score = deeper_bias64(&tmp, DEEPER_QUALITY);
+                if (quiet <= 0) {
+                    bias_result_print(" = ", score, "\n");
+                }
+                if (score.rms_deviation < best_score.rms_deviation) {
                     best_score = score;
                     best = tmp;
                     found = 1;
@@ -527,10 +569,11 @@ main(int argc, char **argv)
                     printf("  ");
                     hash_print(&tmp);
                 }
-                double score = deeper_bias64(&tmp, DEEPER_QUALITY);
-                if (quiet <= 0)
-                    printf(" = %.17g\n", score);
-                if (score < best_score) {
+                struct deeper_bias_result score = deeper_bias64(&tmp, DEEPER_QUALITY);
+                if (quiet <= 0) {
+                    bias_result_print(" = ", score, "\n");
+                }
+                if (score.rms_deviation < best_score.rms_deviation) {
                     best_score = score;
                     best = tmp;
                     found = 1;
@@ -550,17 +593,17 @@ main(int argc, char **argv)
             if (quiet < 1)
                 puts("DONE");
             hash_print(&cur);
-            printf(" = %.17g\n", cur_score);
+            bias_result_print(" = ", cur_score, "\n");
             break;
         } else {
             /* Hit local minima, reset */
             if (quiet < 1)
                 puts("RESET");
             hash_print(&cur);
-            printf(" = %.17g\n", cur_score);
+            bias_result_print(" = ", cur_score, "\n");
             last.s[0] = 0; // set to invalid
             hash_gen_strict(&cur, rng);
-            cur_score = -1;
+            cur_score = (struct deeper_bias_result){-1.0, 0.0, 0.0};
         }
     }
 }

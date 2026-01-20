@@ -11,12 +11,12 @@ import sys
 # For example, the operation [x XOR 0x01] would be represented as a 64x64 array where
 #    the first column is all 1.0 (indicating that flipping the least significant bit
 #    of the input always flips the least significant bit of the output), and all other
-#    columns are 0.0.
+#    columns are 0.0, except for the diagonal which would also be 1.0.
 AvalancheArray: TypeAlias = npt.NDArray[np.float64]
 AvalancheArrayMeanP95: TypeAlias = Tuple[AvalancheArray, AvalancheArray, AvalancheArray]
 Inputs: TypeAlias = npt.NDArray[np.uint64]  # 1D array of uint64 values
 
-NBITS = 8
+NBITS = 32
 
 pool = ThreadPoolExecutor()
 
@@ -67,15 +67,74 @@ def calculate_avalanche(operation: op, n: int) -> AvalancheArrayMeanP95:
     for input_bit, row in results:
         avalanche[input_bit, :] = row
 
-    # Calculate p95 confidence intervals using binomial proportion confidence interval
-    # For each cell, we have n Bernoulli trials with observed probability p = avalanche[i,j]
-    # Using normal approximation: std_error = sqrt(p * (1-p) / n)
-    # 95% CI is approximately p ± 1.96 * std_error
-    std_error = np.sqrt(avalanche * (1 - avalanche) / n)
-    margin = 1.96 * std_error
-    lower_p95 = np.clip(avalanche - margin, 0.0, 1.0)
-    upper_p95 = np.clip(avalanche + margin, 0.0, 1.0)
+    # Calculate p95 confidence intervals for each cell as a binomial proportion.
+    # Use the Wilson score interval (much more reliable than the normal approximation,
+    # especially when the observed proportion is 0 or 1).
+    lower_p95, upper_p95, _, _ = wilson_interval(avalanche, n, z=1.96)
     return [avalanche, lower_p95, upper_p95]
+
+
+def wilson_interval(
+    p_hat: AvalancheArray,
+    n: int,
+    *,
+    z: float = 1.96,
+) -> tuple[AvalancheArray, AvalancheArray, AvalancheArray, AvalancheArray]:
+    """Compute Wilson score CI for a binomial proportion.
+
+    Args:
+        p_hat: Observed proportion(s) in [0,1]. Can be a scalar/array.
+        n: Number of Bernoulli trials.
+        z: Z critical value (default 1.96 for ~95% CI).
+
+    Returns:
+        (low, high, center, se_est)
+        where se_est is approximated as (high-low)/(2*z).
+    """
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    z2 = z * z
+    denom = 1.0 + (z2 / n)
+    center = (p_hat + (z2 / (2.0 * n))) / denom
+    margin = (z * np.sqrt((p_hat * (1.0 - p_hat) / n) + (z2 / (4.0 * n * n)))) / denom
+    low = np.clip(center - margin, 0.0, 1.0)
+    high = np.clip(center + margin, 0.0, 1.0)
+    se_est = (high - low) / (2.0 * z)
+    return low, high, center, se_est
+
+
+def z_scores_from_samples(
+    estimated: AvalancheArray,
+    observed: AvalancheArray,
+    n: int,
+    *,
+    z: float = 1.96,
+) -> AvalancheArray:
+    """Compute per-cell z-scores comparing an estimate to sampled proportions.
+
+    We use the Wilson interval to derive a stable standard error estimate even
+    when observed proportions are 0 or 1.
+
+    Returns:
+        zscore matrix with same shape as inputs.
+    """
+    _, _, center, se = wilson_interval(observed, n, z=z)
+    # Avoid divide-by-zero (shouldn't happen for finite n, but keep it safe).
+    safe_se = np.where(se > 0.0, se, np.inf)
+    return (estimated - center) / safe_se
+
+
+def zscore_summary(zmat: AvalancheArray) -> tuple[float, float, float, float]:
+    """Summarize a z-score matrix.
+
+    Returns:
+        (mean_z, rms_z, max_abs_z, frac_abs_z_gt_3)
+    """
+    mean_z = float(np.mean(zmat))
+    rms_z = float(np.sqrt(np.mean(zmat * zmat)))
+    max_abs_z = float(np.max(np.abs(zmat)))
+    frac_abs_z_gt_3 = float(np.mean(np.abs(zmat) > 3.0))
+    return mean_z, rms_z, max_abs_z, frac_abs_z_gt_3
 
 
 class BiasTarget(enum.Enum):
@@ -498,27 +557,6 @@ def test_add_exhaustive(constant: int) -> bool:
     return np.allclose(exact_avalanche, model_avalanche, rtol=1e-10, atol=1e-10)
 
 
-def estimate_multiply(constant: int) -> AvalancheArray:
-    return identity(NBITS)
-
-def test_multiply(x: int, n: int) -> float:
-    """Test the avalanche effect of a multiplication operation with a constant."""
-    def op_func(inputs: Inputs) -> Inputs:
-        return inputs * np.uint64(x)
-
-    # Placeholder for estimated multiplication avalanche
-    estimated = estimate_multiply(x)  # Replace with actual estimation logic if available
-    _, low_actual, high_actual = calculate_avalanche(op_func, n)
-
-    # Calculate the percentage of estimated that were within the p95
-    within_p95 = np.logical_and(
-        estimated >= low_actual,
-        estimated <= high_actual
-    )
-
-    return 100.0 * np.sum(within_p95) / (NBITS * NBITS)
-
-
 def estimate_add(constant: int) -> AvalancheArray:
     """Estimate the avalanche effect of adding a constant, matching exact_model_add.
     
@@ -620,20 +658,244 @@ def test_add(x: int, n: int) -> float:
 
     return 100.0 * np.sum(within_p95) / (NBITS * NBITS)
 
+
+def estimate_add_shift(shift: int) -> AvalancheArray:
+    """Estimate the avalanche effect of ``y = x + (x << shift)``.
+
+    This is the special-case multiply ``y = x * (1 + 2**shift)``.
+
+    Key facts (for shift > 0):
+    - The lower ``shift`` output bits are unchanged: ``y[j] == x[j]`` for ``j < shift``.
+      So columns ``j < shift`` form an identity.
+    - Flipping input bit ``i`` toggles the addend bit at position ``i`` (from the ``x`` term)
+      and also toggles the addend bit at position ``i + shift`` (from the shifted term), if in range.
+    - Above the first affected bit, differences only propagate upward through carries.
+
+        This implementation computes the probabilities exactly (for uniform random inputs)
+        using dynamic programming over the adder's carry state plus the minimum required
+        memory to provide the delayed bit ``x[j-shift]``.
+
+        Runtime is exponential in ``min(shift, NBITS-shift)`` (not in ``NBITS``), and is therefore
+        strictly better than exhaustive ``O(2**NBITS)`` enumeration while still matching
+        ``exact_model_add_shift`` exactly for practical parameter ranges.
+    """
+    if shift < 0 or shift >= NBITS:
+        raise ValueError(f"shift must be in [0, {NBITS - 1}], got {shift}")
+
+    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
+
+    # Special case: shift=0 => y = x + x = 2*x = x<<1 (mod 2**NBITS)
+    if shift == 0:
+        for i in range(NBITS):
+            out_bit = i + 1
+            if out_bit < NBITS:
+                avalanche[i, out_bit] = 1.0
+        return avalanche
+
+    # We compute rows exactly via dynamic programming over a compact state:
+    # - Carries (c, c') for original vs flipped input (4 possibilities)
+    # - A "memory" state sufficient to recover b[j] = x[j-shift]
+    #   * If shift is small: keep a shift-length sliding window of prior x bits (2**shift states)
+    #   * If shift is large: only the lowest (NBITS-shift) bits of x ever appear as b[j],
+    #     so keep that fixed prefix instead (2**(NBITS-shift) states)
+    # Complexity per row: O(NBITS * 2**min(shift, NBITS-shift)).
+
+    m = NBITS - shift  # number of input bits that are ever used as b[j]
+    use_prefix = shift > m
+    width = m if use_prefix else shift
+
+    # Guardrail: this is still exponential in width; keep it practical.
+    # (This is still far better than O(2**NBITS) when width is modest.)
+    if width > 20:
+        raise ValueError(
+            f"estimate_add_shift state size too large: width={width} (2**width states). "
+            "Try a smaller shift/bit-width, or adjust the algorithm." 
+        )
+
+    n_states = 1 << width
+    states = np.arange(n_states, dtype=np.uint32)
+    dp = np.zeros((n_states, 4), dtype=np.float64)
+    dp[0, 0] = 1.0  # state=0, (c,c')=(0,0)
+
+    c0_in = np.array([0, 0, 1, 1], dtype=np.uint8)
+    c1_in = np.array([0, 1, 0, 1], dtype=np.uint8)
+
+    def add_carry(a: np.uint8, b: npt.NDArray[np.uint8], c: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+        return ((a & b) | (a & c) | (b & c)).astype(np.uint8)
+
+    for input_bit in range(NBITS):
+        dp.fill(0.0)
+        dp[0, 0] = 1.0
+
+        for j in range(NBITS):
+            dp_next = np.zeros_like(dp)
+
+            # Determine b[j] for each state.
+            if use_prefix:
+                # For shift > m, we have j < shift for all j < shift, so b[j]=0 until j reaches shift.
+                if j < shift:
+                    b = np.zeros(n_states, dtype=np.uint8)
+                else:
+                    b = ((states >> np.uint32(j - shift)) & 1).astype(np.uint8)
+            else:
+                # Sliding window; b[j] is the oldest bit in the window.
+                b = ((states >> np.uint32(width - 1)) & 1).astype(np.uint8)
+
+            toggle_a = 1 if j == input_bit else 0
+            toggle_b = 1 if (input_bit + shift) < NBITS and j == (input_bit + shift) else 0
+
+            # Branch on x[j] = 0/1, each with probability 1/2.
+            for x in (0, 1):
+                a = np.uint8(x)
+                a_p = np.uint8(x ^ toggle_a)
+                b_p = (b ^ np.uint8(toggle_b)).astype(np.uint8)
+
+                # Compute sum-bit differences for each (state, carry-pair).
+                sum0 = (a ^ b[:, None] ^ c0_in[None, :]).astype(np.uint8)
+                sum1 = (a_p ^ b_p[:, None] ^ c1_in[None, :]).astype(np.uint8)
+                diff = (sum0 != sum1)
+                avalanche[input_bit, j] += 0.5 * float(np.sum(dp * diff))
+
+                # Compute carry outs for each carry-pair.
+                b2 = b[:, None]
+                b2p = b_p[:, None]
+                c02 = c0_in[None, :]
+                c12 = c1_in[None, :]
+                co0 = add_carry(a, b2, c02)
+                co1 = add_carry(a_p, b2p, c12)
+                co_pair = (co0 * 2 + co1).astype(np.uint8)  # 0..3
+
+                # State transition.
+                if use_prefix:
+                    if j < m:
+                        next_state = states | (np.uint32(x) << np.uint32(j))
+                    else:
+                        next_state = states
+                else:
+                    mask = np.uint32(n_states - 1)
+                    next_state = ((states << 1) & mask) | np.uint32(x)
+
+                # Scatter-add contributions into dp_next.
+                for cp in range(4):
+                    np.add.at(dp_next, (next_state, co_pair[:, cp]), 0.5 * dp[:, cp])
+
+            dp = dp_next
+
+    return avalanche
+
+
+def exact_model_add_shift(shift: int) -> AvalancheArray:
+    """Calculate the exact avalanche matrix for x + (x << shift) via exhaustive enumeration.
+    
+    For y = x + (x << shift), when input bit i is flipped:
+    - The x term contributes a flip at position i
+    - The (x << shift) term contributes a flip at position i + shift (if in range)
+    - These two contributions are added together, causing carry propagation
+    
+    The interaction between these two contributions and carry propagation makes
+    this non-trivial to model analytically, so we compute exhaustively.
+    
+    Args:
+        shift: The shift amount (0 to NBITS-1)
+    
+    Returns:
+        A NBITS x NBITS matrix where element [i, j] represents the probability
+        that flipping input bit i will cause output bit j to flip.
+    """
+    mask = (1 << NBITS) - 1
+    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
+    
+    # Special case: shift = 0 means x + x = 2*x = x << 1
+    # This is just a left shift by 1, which has a simple pattern
+    
+    for input_bit in range(NBITS):
+        flip_counts = np.zeros(NBITS, dtype=np.int64)
+        
+        for x in range(1 << NBITS):
+            y_original = (x + (x << shift)) & mask
+            x_flipped = x ^ (1 << input_bit)
+            y_flipped = (x_flipped + (x_flipped << shift)) & mask
+            
+            diff = y_original ^ y_flipped
+            for j in range(NBITS):
+                if (diff >> j) & 1:
+                    flip_counts[j] += 1
+        
+        avalanche[input_bit, :] = flip_counts / (1 << NBITS)
+    
+    return avalanche
+
+def test_add_shift(shift: int, n: int) -> float:
+    """Test the avalanche effect of an XOR operation with a constant."""
+    def op_func(inputs: Inputs) -> Inputs:
+        return inputs + (inputs << np.uint64(shift))
+
+    estimated = estimate_add_shift(shift)
+    actual, low_actual, high_actual = calculate_avalanche(op_func, n)
+
+    # Z-score summary (useful when within-p95 is misleading for tiny probabilities).
+    zmat = z_scores_from_samples(estimated, actual, n)
+    mean_z, rms_z, max_abs_z, frac_abs_z_gt_3 = zscore_summary(zmat)
+    # Attach for debugging/inspection without changing the return type.
+    test_add_shift.last_z_summary = (mean_z, rms_z, max_abs_z, frac_abs_z_gt_3)
+
+    # Calculate the percentage of estimated that were within the p95
+    within_p95 = np.logical_and(
+        estimated >= low_actual,
+        estimated <= high_actual
+    )
+
+    return 100.0 * np.sum(within_p95) / (NBITS * NBITS)
+
+
 def main() -> None:
-    print("\nRunning multiplication tests...")
+    print("\nRunning operation tests...")
     n = 10000
     accuracies = list()
-    for x in range(64):
-        constant = np.random.randint(0, 2**NBITS, dtype=np.uint64)
-        accuracy = test_add(constant, n)
+    z_means: list[float] = []
+    z_rms: list[float] = []
+    z_max_abs: list[float] = []
+    z_frac_gt_3: list[float] = []
+    for x in range(NBITS):
+        accuracy = test_add_shift(x, n)
+        mean_z, rms_z, max_abs_z, frac_abs_z_gt_3 = getattr(
+            test_add_shift,
+            "last_z_summary",
+            (float("nan"), float("nan"), float("nan"), float("nan")),
+        )
         accuracies.append(accuracy)
-        print(f"multiply with {constant:#018x}: {accuracy:.2f}% of estimates within 95% confidence interval over {n} samples.")
+        z_means.append(float(mean_z))
+        z_rms.append(float(rms_z))
+        z_max_abs.append(float(max_abs_z))
+        z_frac_gt_3.append(float(frac_abs_z_gt_3))
+        print(
+            f"op with {x:#018x}: {accuracy:.2f}% within 95% CI over {n} samples "
+            f"(mean z={mean_z:.2f}, rms z={rms_z:.2f}, max |z|={max_abs_z:.2f}, |z|>3={100.0*frac_abs_z_gt_3:.2f}%)."
+        )
 
     average_accuracy = sum(accuracies) / len(accuracies)
     print(f"Average accuracy: {average_accuracy:.2f}% of estimates within 95% confidence interval over {n} samples.")
 
-    if average_accuracy < 97.0:
+    # Unbiasedness / calibration checks.
+    # Interpreting z-scores:
+    # - If the estimator is unbiased and the sampling error model is reasonable, z should be ~N(0,1).
+    # - We allow slack because cells are not perfectly independent and tails are sensitive to small-probability events.
+    mean_abs_z_mean = float(np.mean(np.abs(z_means)))
+    mean_rms_z = float(np.mean(z_rms))
+    max_abs_z_overall = float(np.max(z_max_abs))
+    mean_frac_gt_3 = float(np.mean(z_frac_gt_3))
+    print(
+        "Z-score summary over shifts: "
+        f"mean(|mean z|)={mean_abs_z_mean:.3f}, mean(rms z)={mean_rms_z:.3f}, "
+        f"max(max |z|)={max_abs_z_overall:.2f}, mean(|z|>3)={100.0*mean_frac_gt_3:.2f}%."
+    )
+
+    # This metric is the fraction of cells whose estimate falls within a per-cell 95% CI
+    # computed from finite samples. Even with a perfect model, expected coverage is ~95%.
+    #
+    # The z-score checks aim to detect systematic bias beyond sampling noise.
+    # Thresholds are intentionally tolerant.
+    if average_accuracy < 92.0 or mean_abs_z_mean > 0.25 or mean_rms_z > 2.0 or mean_frac_gt_3 > 0.05:
         sys.exit(1)
 
 

@@ -1,2 +1,6 @@
 prospector
+genetic
+hillclimb
+hillclimb64
+hp16
 *.so

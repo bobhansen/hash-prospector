@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import numpy.typing as npt
 from typing import Callable, Tuple, TypeAlias
+from functools import lru_cache
 import enum
 import sys
 
@@ -678,9 +679,16 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
         Runtime is exponential in ``min(shift, NBITS-shift)`` (not in ``NBITS``), and is therefore
         strictly better than exhaustive ``O(2**NBITS)`` enumeration while still matching
         ``exact_model_add_shift`` exactly for practical parameter ranges.
+
+        Special fast paths:
+        - ``shift >= NBITS``: the shifted term contributes nothing to the low NBITS bits, so this is
+            exactly the identity matrix.
+        - ``NBITS`` even and ``shift == NBITS/2``: the operation cleanly decomposes into a low-half
+            identity plus a high-half "add two independent uniform words" model, which we compute in
+            O((NBITS/2)^2) time (e.g. essentially instant for NBITS=64, shift=32).
     """
-    if shift < 0 or shift >= NBITS:
-        raise ValueError(f"shift must be in [0, {NBITS - 1}], got {shift}")
+    if shift < 0:
+        raise ValueError(f"shift must be non-negative, got {shift}")
 
     avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
 
@@ -691,6 +699,38 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
             if out_bit < NBITS:
                 avalanche[i, out_bit] = 1.0
         return avalanche
+
+    # If shift >= NBITS, then (x << shift) contributes nothing to the low NBITS bits.
+    # There is no carry propagation downward, so y == x over the observed NBITS.
+    if shift >= NBITS:
+        return identity(NBITS)
+
+    # Fast exact case: NBITS even and shift == NBITS/2.
+    # Write x = lo + (hi << h), with h = NBITS/2. Then:
+    #   (x << h) mod 2**NBITS = (lo << h)
+    #   y = x + (x << h) = lo + ((hi + lo) << h)
+    # The low half is identity, and the high half is (hi + lo) mod 2**h where hi,lo are independent uniform.
+    if (NBITS % 2 == 0) and (shift == (NBITS // 2)):
+        h = NBITS // 2
+
+        for i in range(h):
+            avalanche[i, i] = 1.0
+
+        for i in range(h):
+            for j in range(i, h):
+                p = 0.5 ** (j - i)
+                avalanche[i, h + j] = p
+                avalanche[h + i, h + j] = p
+
+        return avalanche
+
+    # For shift close to NBITS/2 from below, only a small "overlap" of bits can reappear
+    # in b[j]=x[j-shift] *after* carry becomes non-trivial. We can compute the avalanche
+    # exactly by tracking just those overlap bits.
+    if shift <= (NBITS // 2):
+        overlap = NBITS - 2 * shift
+        if overlap <= 12:
+            return _estimate_add_shift_overlap_dp(shift, overlap)
 
     # We compute rows exactly via dynamic programming over a compact state:
     # - Carries (c, c') for original vs flipped input (4 possibilities)
@@ -704,18 +744,309 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
     use_prefix = shift > m
     width = m if use_prefix else shift
 
-    # Guardrail: this is still exponential in width; keep it practical.
-    # (This is still far better than O(2**NBITS) when width is modest.)
+    # For larger widths, fall back to a carry Markov model that runs in O(NBITS^2).
+    # For shift > NBITS/2 this is exact; otherwise it's an approximation.
+    if width > 12:
+        return _estimate_add_shift_markov(shift)
+
+    pre = _add_shift_precompute(NBITS, shift)
+    n_states = pre["n_states"]
+    states = pre["states"]
+    b_by_j = pre["b_by_j"]
+    next_state_by_j_x0 = pre["next_state_by_j_x0"]
+    next_state_by_j_x1 = pre["next_state_by_j_x1"]
+    co_pair_no_toggle_x0 = pre["co_pair_no_toggle_x0"]
+    co_pair_no_toggle_x1 = pre["co_pair_no_toggle_x1"]
+    c0_in = pre["c0_in"]
+    c1_in = pre["c1_in"]
+
+    dp = np.zeros((n_states, 4), dtype=np.float64)
+    dp_next = np.zeros((n_states, 4), dtype=np.float64)
+    dp[0, 0] = 1.0  # state=0, (c,c')=(0,0)
+
+    def add_carry(a: np.uint8, b: npt.NDArray[np.uint8], c: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+        return ((a & b) | (a & c) | (b & c)).astype(np.uint8)
+
+    def scatter_add_dp(
+        out: npt.NDArray[np.float64],
+        next_state: npt.NDArray[np.uint32],
+        co_pair: npt.NDArray[np.uint8],
+        in_dp: npt.NDArray[np.float64],
+        weight: float,
+    ) -> None:
+        """Accumulate dp transitions into out using a bincount scatter.
+
+        out and in_dp are shape (n_states, 4).
+        next_state is shape (n_states,), co_pair is shape (n_states, 4).
+        """
+        flat_size = int(out.size)
+        base = (next_state.astype(np.int64) * 4)
+        # Build flat indices for each carry-pair column.
+        idx0 = base + co_pair[:, 0].astype(np.int64)
+        idx1 = base + co_pair[:, 1].astype(np.int64)
+        idx2 = base + co_pair[:, 2].astype(np.int64)
+        idx3 = base + co_pair[:, 3].astype(np.int64)
+        weights = np.concatenate(
+            [
+                in_dp[:, 0] * weight,
+                in_dp[:, 1] * weight,
+                in_dp[:, 2] * weight,
+                in_dp[:, 3] * weight,
+            ]
+        )
+        idx = np.concatenate([idx0, idx1, idx2, idx3])
+        out.reshape(-1)[:] += np.bincount(idx, weights=weights, minlength=flat_size)
+
+    for input_bit in range(NBITS):
+        dp.fill(0.0)
+        dp[0, 0] = 1.0
+
+        shifted_toggle_bit = input_bit + shift
+        for j in range(NBITS):
+            dp_next.fill(0.0)
+
+            b = b_by_j[j]
+            next0 = next_state_by_j_x0[j]
+            next1 = next_state_by_j_x1[j]
+
+            toggle_a = j == input_bit
+            toggle_b = (shifted_toggle_bit < NBITS) and (j == shifted_toggle_bit)
+
+            # If neither a nor b toggles at this position, the only source of output-bit
+            # differences is carry-in differences (c != c').
+            if not toggle_a and not toggle_b:
+                # Both x=0 and x=1 branches contribute equally to avalanche via carry-diff.
+                avalanche[input_bit, j] += float(np.sum(dp[:, 1] + dp[:, 2]))
+                scatter_add_dp(dp_next, next0, co_pair_no_toggle_x0[j], dp, 0.5)
+                scatter_add_dp(dp_next, next1, co_pair_no_toggle_x1[j], dp, 0.5)
+                dp, dp_next = dp_next, dp
+                continue
+
+            # Otherwise, handle the (rare) toggle positions explicitly.
+            b2 = b[:, None]
+            c02 = c0_in[None, :]
+            c12 = c1_in[None, :]
+
+            for x in (0, 1):
+                a = np.uint8(x)
+                a_p = np.uint8(x ^ int(toggle_a))
+                b_p = (b ^ np.uint8(int(toggle_b))).astype(np.uint8)
+
+                sum0 = (a ^ b[:, None] ^ c0_in[None, :]).astype(np.uint8)
+                sum1 = (a_p ^ b_p[:, None] ^ c1_in[None, :]).astype(np.uint8)
+                diff = (sum0 != sum1)
+                avalanche[input_bit, j] += 0.5 * float(np.sum(dp * diff))
+
+                b2p = b_p[:, None]
+                co0 = add_carry(a, b2, c02)
+                co1 = add_carry(a_p, b2p, c12)
+                co_pair = (co0 * 2 + co1).astype(np.uint8)
+
+                if x == 0:
+                    scatter_add_dp(dp_next, next0, co_pair, dp, 0.5)
+                else:
+                    scatter_add_dp(dp_next, next1, co_pair, dp, 0.5)
+
+            dp, dp_next = dp_next, dp
+
+    return avalanche
+
+
+def _estimate_add_shift_markov(shift: int) -> AvalancheArray:
+    """Scalable estimate for y = x + (x<<shift) using a carry-pair Markov model.
+
+    Assumptions:
+    - Input bits x[k] are independent Bernoulli(0.5).
+        - For each bit position j >= shift, the addend bits (a=x[j], b=x[j-shift]) are treated as
+            independent of the carry state.
+
+        Notes:
+        - If shift > NBITS/2, this model is exact because b only references bits from the carry-free region.
+        - If shift <= NBITS/2, this ignores long-range dependence between b and carry (approximation).
+
+    Runs in O(NBITS^2) time.
+    """
+    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
+
+    # Carry-pair state index: (c << 1) | c'
+    # 0: (0,0), 1: (0,1), 2: (1,0), 3: (1,1)
+    carry_pairs = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    def carry_out(a: int, b: int, c: int) -> int:
+        return (a & b) | (a & c) | (b & c)
+
+    # Precompute local (diff_prob[4], trans[4,4]) for pb in {0.0, 0.5} and toggles.
+    # pb=0.0 means b is constant 0; pb=0.5 means b is uniform random.
+    local = {}
+    for pb in (0.0, 0.5):
+        b_values = (0,) if pb == 0.0 else (0, 1)
+        for ta in (0, 1):
+            for tb in (0, 1):
+                diff_prob = np.zeros(4, dtype=np.float64)
+                trans = np.zeros((4, 4), dtype=np.float64)
+                for s_idx, (c, cp) in enumerate(carry_pairs):
+                    for a in (0, 1):
+                        pa = 0.5
+                        for b in b_values:
+                            pbv = 1.0 if pb == 0.0 else 0.5
+                            w = pa * pbv
+
+                            ap = a ^ ta
+                            bp = b ^ tb
+
+                            s0 = a ^ b ^ c
+                            s1 = ap ^ bp ^ cp
+                            if s0 != s1:
+                                diff_prob[s_idx] += w
+
+                            co0 = carry_out(a, b, c)
+                            co1 = carry_out(ap, bp, cp)
+                            ns = (co0 << 1) | co1
+                            trans[s_idx, ns] += w
+                local[(pb, ta, tb)] = (diff_prob, trans)
+
+    for input_bit in range(NBITS):
+        dist = np.zeros(4, dtype=np.float64)
+        dist[0] = 1.0
+
+        toggle_b_bit = input_bit + shift
+        for j in range(NBITS):
+            pb = 0.0 if j < shift else 0.5
+            ta = 1 if j == input_bit else 0
+            tb = 1 if (toggle_b_bit < NBITS and j == toggle_b_bit) else 0
+            diff_prob, trans = local[(pb, ta, tb)]
+
+            avalanche[input_bit, j] = float(dist @ diff_prob)
+            dist = dist @ trans
+
+    return avalanche
+
+
+def _estimate_add_shift_overlap_dp(shift: int, overlap: int) -> AvalancheArray:
+    """Exact avalanche for y = x + (x<<shift) when overlap = NBITS-2*shift is small.
+
+    For j < shift, b[j]=0 and carry is identically 0.
+    For shift <= j < 2*shift, b[j]=x[j-shift] references carry-free bits, so it is independent noise.
+    For j >= 2*shift, b[j]=x[j-shift] references bits in x[shift .. NBITS-shift-1], the "overlap".
+    Tracking only those overlap bits yields an exact DP with 2**overlap states.
+    """
+    if overlap < 0:
+        raise ValueError(f"overlap must be >= 0, got {overlap}")
+    if overlap == 0:
+        return _estimate_add_shift_markov(shift)
+
+    n_states = 1 << overlap
+    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
+
+    # carry-pair state index: (c<<1) | c'
+    carry_pairs = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    def carry_out(a: int, b: int, c: int) -> int:
+        return (a & b) | (a & c) | (b & c)
+
+    for input_bit in range(NBITS):
+        dp = np.zeros((n_states, 4), dtype=np.float64)
+        dp_next = np.zeros((n_states, 4), dtype=np.float64)
+        dp[0, 0] = 1.0
+
+        toggle_b_bit = input_bit + shift
+
+        for j in range(NBITS):
+            dp_next.fill(0.0)
+
+            b_mode: str
+            read_idx = -1
+            if j < shift:
+                b_mode = "const0"
+            elif j < 2 * shift:
+                b_mode = "random"
+            else:
+                b_mode = "state"
+                read_idx = j - 2 * shift
+
+            write_idx = -1
+            do_write = False
+            if shift <= j < (shift + overlap):
+                do_write = True
+                write_idx = j - shift
+
+            for state in range(n_states):
+                if b_mode == "state":
+                    b_fixed = (state >> read_idx) & 1
+
+                for cp_idx, (c, cp) in enumerate(carry_pairs):
+                    p_in = dp[state, cp_idx]
+                    if p_in == 0.0:
+                        continue
+
+                    for a in (0, 1):
+                        wa = 0.5
+                        ap = a ^ (1 if j == input_bit else 0)
+
+                        if b_mode == "const0":
+                            b_values = ((0, 1.0),)
+                        elif b_mode == "random":
+                            b_values = ((0, 0.5), (1, 0.5))
+                        else:
+                            b_values = ((b_fixed, 1.0),)
+
+                        for b, wb in b_values:
+                            w = wa * wb
+                            bp = b ^ (1 if (toggle_b_bit < NBITS and j == toggle_b_bit) else 0)
+
+                            s0 = a ^ b ^ c
+                            s1 = ap ^ bp ^ cp
+                            if s0 != s1:
+                                avalanche[input_bit, j] += p_in * w
+
+                            co0 = carry_out(a, b, c)
+                            co1 = carry_out(ap, bp, cp)
+                            next_cp = (co0 << 1) | co1
+
+                            next_state = state
+                            if do_write and a == 1:
+                                next_state = state | (1 << write_idx)
+
+                            dp_next[next_state, next_cp] += p_in * w
+
+            dp, dp_next = dp_next, dp
+
+    return avalanche
+
+
+@lru_cache(maxsize=None)
+def _states_for_width(width: int) -> npt.NDArray[np.uint32]:
+    n_states = 1 << width
+    return np.arange(n_states, dtype=np.uint32)
+
+
+@lru_cache(maxsize=None)
+def _add_shift_precompute(nbits: int, shift: int) -> dict:
+    """Precompute DP tables for estimate_add_shift.
+
+    This cache assumes the caller treats returned arrays as read-only.
+    Keyed by (nbits, shift). If NBITS is constant over a run, this lets repeated
+    calls reuse tables. Some internal arrays (like `states`) are additionally
+    shared by `width` via `_states_for_width`.
+    """
+    if shift < 0 or shift >= nbits:
+        raise ValueError(f"shift must be in [0, {nbits - 1}], got {shift}")
+    if shift == 0:
+        raise ValueError("shift=0 has no DP precompute")
+
+    m = nbits - shift
+    use_prefix = shift > m
+    width = m if use_prefix else shift
+    if width <= 0:
+        raise ValueError(f"invalid width computed: {width}")
     if width > 20:
         raise ValueError(
             f"estimate_add_shift state size too large: width={width} (2**width states). "
-            "Try a smaller shift/bit-width, or adjust the algorithm." 
+            "Try a smaller shift/bit-width, or adjust the algorithm."
         )
 
     n_states = 1 << width
-    states = np.arange(n_states, dtype=np.uint32)
-    dp = np.zeros((n_states, 4), dtype=np.float64)
-    dp[0, 0] = 1.0  # state=0, (c,c')=(0,0)
+    states = _states_for_width(width)
 
     c0_in = np.array([0, 0, 1, 1], dtype=np.uint8)
     c1_in = np.array([0, 1, 0, 1], dtype=np.uint8)
@@ -723,65 +1054,63 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
     def add_carry(a: np.uint8, b: npt.NDArray[np.uint8], c: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
         return ((a & b) | (a & c) | (b & c)).astype(np.uint8)
 
-    for input_bit in range(NBITS):
-        dp.fill(0.0)
-        dp[0, 0] = 1.0
+    b_by_j: list[npt.NDArray[np.uint8]] = []
+    next_state_by_j_x0: list[npt.NDArray[np.uint32]] = []
+    next_state_by_j_x1: list[npt.NDArray[np.uint32]] = []
 
-        for j in range(NBITS):
-            dp_next = np.zeros_like(dp)
-
-            # Determine b[j] for each state.
-            if use_prefix:
-                # For shift > m, we have j < shift for all j < shift, so b[j]=0 until j reaches shift.
-                if j < shift:
-                    b = np.zeros(n_states, dtype=np.uint8)
-                else:
-                    b = ((states >> np.uint32(j - shift)) & 1).astype(np.uint8)
+    for j in range(nbits):
+        if use_prefix:
+            if j < shift:
+                b = np.zeros(n_states, dtype=np.uint8)
             else:
-                # Sliding window; b[j] is the oldest bit in the window.
-                b = ((states >> np.uint32(width - 1)) & 1).astype(np.uint8)
+                b = ((states >> np.uint32(j - shift)) & 1).astype(np.uint8)
+        else:
+            b = ((states >> np.uint32(width - 1)) & 1).astype(np.uint8)
+        b_by_j.append(b)
 
-            toggle_a = 1 if j == input_bit else 0
-            toggle_b = 1 if (input_bit + shift) < NBITS and j == (input_bit + shift) else 0
+        if use_prefix:
+            if j < m:
+                next0 = states
+                next1 = states | (np.uint32(1) << np.uint32(j))
+            else:
+                next0 = states
+                next1 = states
+        else:
+            mask = np.uint32(n_states - 1)
+            next0 = (states << 1) & mask
+            next1 = ((states << 1) & mask) | np.uint32(1)
+        next_state_by_j_x0.append(next0)
+        next_state_by_j_x1.append(next1)
 
-            # Branch on x[j] = 0/1, each with probability 1/2.
-            for x in (0, 1):
-                a = np.uint8(x)
-                a_p = np.uint8(x ^ toggle_a)
-                b_p = (b ^ np.uint8(toggle_b)).astype(np.uint8)
+    co_pair_no_toggle_x0: list[npt.NDArray[np.uint8]] = []
+    co_pair_no_toggle_x1: list[npt.NDArray[np.uint8]] = []
+    for j in range(nbits):
+        b = b_by_j[j]
+        b2 = b[:, None]
+        c02 = c0_in[None, :]
+        c12 = c1_in[None, :]
 
-                # Compute sum-bit differences for each (state, carry-pair).
-                sum0 = (a ^ b[:, None] ^ c0_in[None, :]).astype(np.uint8)
-                sum1 = (a_p ^ b_p[:, None] ^ c1_in[None, :]).astype(np.uint8)
-                diff = (sum0 != sum1)
-                avalanche[input_bit, j] += 0.5 * float(np.sum(dp * diff))
+        a0 = np.uint8(0)
+        co0 = add_carry(a0, b2, c02)
+        co1 = add_carry(a0, b2, c12)
+        co_pair_no_toggle_x0.append((co0 * 2 + co1).astype(np.uint8))
 
-                # Compute carry outs for each carry-pair.
-                b2 = b[:, None]
-                b2p = b_p[:, None]
-                c02 = c0_in[None, :]
-                c12 = c1_in[None, :]
-                co0 = add_carry(a, b2, c02)
-                co1 = add_carry(a_p, b2p, c12)
-                co_pair = (co0 * 2 + co1).astype(np.uint8)  # 0..3
+        a1 = np.uint8(1)
+        co0 = add_carry(a1, b2, c02)
+        co1 = add_carry(a1, b2, c12)
+        co_pair_no_toggle_x1.append((co0 * 2 + co1).astype(np.uint8))
 
-                # State transition.
-                if use_prefix:
-                    if j < m:
-                        next_state = states | (np.uint32(x) << np.uint32(j))
-                    else:
-                        next_state = states
-                else:
-                    mask = np.uint32(n_states - 1)
-                    next_state = ((states << 1) & mask) | np.uint32(x)
-
-                # Scatter-add contributions into dp_next.
-                for cp in range(4):
-                    np.add.at(dp_next, (next_state, co_pair[:, cp]), 0.5 * dp[:, cp])
-
-            dp = dp_next
-
-    return avalanche
+    return {
+        "n_states": n_states,
+        "states": states,
+        "b_by_j": tuple(b_by_j),
+        "next_state_by_j_x0": tuple(next_state_by_j_x0),
+        "next_state_by_j_x1": tuple(next_state_by_j_x1),
+        "co_pair_no_toggle_x0": tuple(co_pair_no_toggle_x0),
+        "co_pair_no_toggle_x1": tuple(co_pair_no_toggle_x1),
+        "c0_in": c0_in,
+        "c1_in": c1_in,
+    }
 
 
 def exact_model_add_shift(shift: int) -> AvalancheArray:
@@ -850,7 +1179,7 @@ def test_add_shift(shift: int, n: int) -> float:
 
 def main() -> None:
     print("\nRunning operation tests...")
-    n = 10000
+    n = 100000
     accuracies = list()
     z_means: list[float] = []
     z_rms: list[float] = []

@@ -232,7 +232,7 @@ class OpType(enum.Enum):
     XOR = enum.auto()
     XOR_SHIFTR = enum.auto()
     ADD = enum.auto()
-    ADD_SHIFT = enum.auto()
+    ADD_SHIFTR = enum.auto()
     MULT = enum.auto()
 
 
@@ -257,14 +257,41 @@ def gen_ops(op_type: OpType) -> list[OpCase]:
     mask = (1 << NBITS) - 1
     hex_width = _hex_width_for_nbits(NBITS)
 
-    if op_type is OpType.XOR:
-        raise NotImplementedError(f"OpType {op_type.name} not implemented yet")
-    elif op_type is OpType.XOR_SHIFTR:
-        raise NotImplementedError(f"OpType {op_type.name} not implemented yet")
-    elif op_type is OpType.ADD:
-        raise NotImplementedError(f"OpType {op_type.name} not implemented yet")
-    elif op_type is OpType.ADD_SHIFT:
-        raise NotImplementedError(f"OpType {op_type.name} not implemented yet")
+    if op_type is OpType.XOR_SHIFTR:
+        # Return all possible shifts from 0 to NBITS-1
+        cases: list[OpCase] = []
+        for shift in range(NBITS):
+            name = f"xor_shiftr shift={shift}"
+
+            def shift_op_func(inputs: Inputs, *, _shift: int = shift) -> Inputs:
+                return inputs ^ (inputs >> np.uint64(_shift))
+
+            cases.append(
+                OpCase(
+                    name=name,
+                    op_func=shift_op_func,
+                    estimate=(lambda _shift=shift: estimate_xor_shiftr(_shift)),
+                    exact=(lambda _shift=shift: exact_avalanche(lambda inputs: inputs ^ (inputs >> np.uint64(_shift)))),
+                )
+            )
+        return cases
+    elif op_type is OpType.ADD_SHIFTR:
+        # Return all possible shifts from 0 to NBITS-1
+        cases: list[OpCase] = []
+        for shift in range(NBITS):
+            name = f"add_shiftr shift={shift}"
+            def add_shiftr_op_func(inputs: Inputs, *, _shift: int = shift) -> Inputs:
+                return inputs + (inputs >> np.uint64(_shift))
+
+            cases.append(
+                OpCase(
+                    name=name,
+                    op_func=add_shiftr_op_func,
+                    estimate=(lambda _shift=shift: estimate_add_shiftr(_shift)),
+                    exact=(lambda _shift=shift: exact_avalanche(lambda inputs: inputs ^ (inputs >> np.uint64(_shift)))),
+                )
+            )
+        return cases
     elif op_type is OpType.MULT:
         # Reuse the existing constant selection logic.
         if NBITS <= 8:

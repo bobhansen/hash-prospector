@@ -234,6 +234,7 @@ class OpType(enum.Enum):
     ADD = enum.auto()
     ADD_SHIFTR = enum.auto()
     MULT = enum.auto()
+    SPLITMIX = enum.auto()
 
 
 @dataclass(frozen=True)
@@ -252,7 +253,7 @@ def _hex_width_for_nbits(nbits: int) -> int:
 def gen_ops(op_type: OpType) -> list[OpCase]:
     """Generate operation callables for the selected op type.
 
-    For now only OpType.MULT is supported.
+    Each OpType returns one or more OpCase variants (e.g. different constants).
     """
     mask = (1 << NBITS) - 1
     hex_width = _hex_width_for_nbits(NBITS)
@@ -275,11 +276,48 @@ def gen_ops(op_type: OpType) -> list[OpCase]:
                 )
             )
         return cases
+
+    elif op_type is OpType.ADD:
+        if NBITS <= 8:
+            constants = list(range(2**NBITS))
+        else:
+            constants = [
+                0,
+                1,
+                2,
+                3,
+                5,
+                (1 << (NBITS - 1)),
+                (1 << (NBITS - 1)) - 1,
+                0x5555555555555555 & mask,
+                0xAAAAAAAAAAAAAAAA & mask,
+                0x0123456789ABCDEF & mask,
+            ]
+            constants.extend([splitmix(s) & mask for s in range(4)])
+
+        cases: list[OpCase] = []
+        for c in constants:
+            name = f"add const={c:#0{hex_width}x}"
+
+            def _add_op_func(inputs: Inputs, *, _c: int = c) -> Inputs:
+                return inputs + np.uint64(_c)
+
+            cases.append(
+                OpCase(
+                    name=name,
+                    op_func=_add_op_func,
+                    estimate=(lambda _c=c: estimate_add(_c)),
+                    exact=((lambda _c=c: exact_avalanche(lambda inputs: inputs + np.uint64(_c))) if NBITS <= 16 else None),
+                )
+            )
+
+        return cases
     elif op_type is OpType.ADD_SHIFTR:
         # Return all possible shifts from 0 to NBITS-1
         cases: list[OpCase] = []
         for shift in range(NBITS):
             name = f"add_shiftr shift={shift}"
+
             def add_shiftr_op_func(inputs: Inputs, *, _shift: int = shift) -> Inputs:
                 return inputs + (inputs >> np.uint64(_shift))
 
@@ -317,19 +355,67 @@ def gen_ops(op_type: OpType) -> list[OpCase]:
             c &= mask
             name = f"mul const={c:#0{hex_width}x}"
 
-            def _op_func(inputs: Inputs, *, _c: int = c) -> Inputs:
+            def _mul_op_func(inputs: Inputs, *, _c: int = c) -> Inputs:
                 return inputs * np.uint64(_c)
 
             cases.append(
                 OpCase(
                     name=name,
-                    op_func=_op_func,
+                    op_func=_mul_op_func,
                     estimate=(lambda _c=c: estimate_multiply(_c)),
                     exact=((lambda _c=c: exact_avalanche(lambda inputs: inputs * np.uint64(_c))) if NBITS <= 16 else None),
                 )
             )
 
         return cases
+
+    elif op_type is OpType.SPLITMIX:
+        # SplitMix64 finalizer-style mix:
+        #   x ^= x >> 30; x *= 0xBF58476D1CE4E5B9;
+        #   x ^= x >> 27; x *= 0x94D049BB133111EB;
+        #   x ^= x >> 31;
+        s1 = NBITS // 2 - 2
+        s2 = (NBITS * 27) // 64
+        s3 = NBITS // 2 - 1
+
+        c1 = (0xBF58476D1CE4E5B9 & mask)
+        c2 = (0x94D049BB133111EB & mask)
+
+        name = f"splitmix s=({s1},{s2},{s3}) c1={c1:#0{hex_width}x} c2={c2:#0{hex_width}x}"
+
+        def _splitmix_op_func(inputs: Inputs) -> Inputs:
+            x = inputs
+            x = x ^ (x >> np.uint64(s1))
+            x = (x * np.uint64(c1)) & np.uint64(mask)
+            x = x ^ (x >> np.uint64(s2))
+            x = (x * np.uint64(c2)) & np.uint64(mask)
+            x = x ^ (x >> np.uint64(s3))
+            return x
+
+        def _estimate() -> AvalancheArray:
+            return estimate_splitmix_finalizer(
+                shift1=s1,
+                shift2=s2,
+                shift3=s3,
+                mult1=c1,
+                mult2=c2,
+            )
+
+        # This estimate composes per-op estimates via an independence assumption,
+        # so it is not expected to match exhaustive enumeration exactly.
+        def exact_splitmix():
+            return (exact_avalanche(_splitmix_op_func))
+
+        return [
+            OpCase(
+                name=name,
+                op_func=_splitmix_op_func,
+                estimate=_estimate,
+                exact=exact_splitmix if NBITS <= 16 else None,
+            )
+        ]
+
+    raise ValueError(f"Unsupported op_type: {op_type}")
 
 
 def estimate_xor(_x: int) -> AvalancheArray:
@@ -374,6 +460,31 @@ def estimate_xor_shiftr(shift: int) -> AvalancheArray:
             avalanche[input_bit, input_bit - shift] = 1.0
     
     return avalanche
+
+
+def estimate_splitmix_finalizer(
+    *,
+    shift1: int,
+    shift2: int,
+    shift3: int,
+    mult1: int,
+    mult2: int,
+) -> AvalancheArray:
+    """Estimate avalanche for the SplitMix-style finalizer.
+
+    This composes existing per-op estimators using `combine_avalanche`.
+    """
+    mats: list[AvalancheArray] = [
+        estimate_xor_shiftr(shift1),
+        estimate_multiply(mult1),
+        estimate_xor_shiftr(shift2),
+        estimate_multiply(mult2),
+        estimate_xor_shiftr(shift3),
+    ]
+    combined = mats[0]
+    for m in mats[1:]:
+        combined = combine_avalanche(combined, m)
+    return combined
 
 
 def compute_conditional_y_probs(constant: int, input_bit: int) -> tuple:

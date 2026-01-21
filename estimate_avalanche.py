@@ -17,7 +17,7 @@ AvalancheArray: TypeAlias = npt.NDArray[np.float64]
 AvalancheArrayMeanP95: TypeAlias = Tuple[AvalancheArray, AvalancheArray, AvalancheArray]
 Inputs: TypeAlias = npt.NDArray[np.uint64]  # 1D array of uint64 values
 
-NBITS = 64
+NBITS = 8
 
 pool = ThreadPoolExecutor()
 
@@ -1286,6 +1286,193 @@ def _odd_multiplier_add_shift_chain(constant: int, nbits: int) -> tuple[int, ...
     return tuple(chain)
 
 
+@lru_cache(maxsize=None)
+def _binom_pmf_half(max_n: int) -> tuple[npt.NDArray[np.float64], ...]:
+    """Binomial(n, 0.5) pmfs for n=0..max_n."""
+    if max_n < 0:
+        raise ValueError(f"max_n must be >= 0, got {max_n}")
+
+    pmfs: list[npt.NDArray[np.float64]] = []
+    # n=0
+    pmfs.append(np.array([1.0], dtype=np.float64))
+    for n in range(1, max_n + 1):
+        prev = pmfs[-1]
+        cur = np.empty(n + 1, dtype=np.float64)
+        cur[0] = 0.5 * prev[0]
+        cur[-1] = 0.5 * prev[-1]
+        cur[1:-1] = 0.5 * (prev[:-1] + prev[1:])
+        pmfs.append(cur)
+    return tuple(pmfs)
+
+
+def _approx_conditional_y_probs_multiply(
+    constant: int,
+    input_bit: int,
+    *,
+    x_value: int,
+) -> npt.NDArray[np.float64]:
+    """Approximate P(y[j]=1 | x[input_bit]=x_value) for y = x*constant (mod 2**NBITS).
+
+    This is a deterministic analytical approximation intended to scale to NBITS=64,
+    while being much more accurate for "hard" cases (e.g. small shifts like 3x).
+
+    Compared to a carry-only Binomial model, this uses a *windowed* carry DP which
+    tracks the last W input bits that can be shared between the current column sum
+    and the carry-in, capturing the dominant dependency.
+
+    If W >= msb(constant), this DP is exact for the conditional output-bit marginals.
+    """
+    if x_value not in (0, 1):
+        raise ValueError(f"x_value must be 0 or 1, got {x_value}")
+    if not (0 <= input_bit < NBITS):
+        raise ValueError(f"input_bit must be in [0, {NBITS - 1}], got {input_bit}")
+
+    mask = (1 << NBITS) - 1
+    c = int(constant) & mask
+    if c == 0:
+        return np.zeros(NBITS, dtype=np.float64)
+
+    # Choose a window that is exact for small-msb constants, and bounded for scalability.
+    msb = c.bit_length() - 1
+    window_max = 4
+    w = min(msb, window_max)
+
+    # carry is bounded by popcount(c)
+    max_carry = c.bit_count()
+    c0 = c & 1
+
+    if w == 0:
+        # Fallback: carry-only Binomial model (no dependency tracking).
+        binom_pmfs = _binom_pmf_half(max_carry)
+        carry_dist = np.zeros(max_carry + 1, dtype=np.float64)
+        carry_dist[0] = 1.0
+        probs = np.zeros(NBITS, dtype=np.float64)
+
+        prefix_mask = 0
+        for j in range(NBITS):
+            prefix_mask |= (1 << j)
+            total = (c & prefix_mask).bit_count()
+            r = total
+
+            # Remove the conditioned contributor if it lands in this column.
+            t_fixed = j - input_bit
+            fixed = 0
+            if 0 <= t_fixed < NBITS and ((c >> t_fixed) & 1) == 1:
+                fixed = x_value
+                r -= 1
+
+            pmf = binom_pmfs[r]
+            tvals = np.arange(r + 1, dtype=np.uint16)
+
+            next_carry = np.zeros_like(carry_dist)
+            p_y1 = 0.0
+            for carry_in, p_c in enumerate(carry_dist):
+                if p_c == 0.0:
+                    continue
+                sums = carry_in + fixed + tvals
+                p_y1 += p_c * float(np.dot(pmf, (sums & 1)))
+                carry_out = (sums >> 1).astype(np.int64)
+                np.add.at(next_carry, carry_out, p_c * pmf)
+
+            probs[j] = p_y1
+            carry_dist = next_carry
+
+        return probs
+
+    # Precompute state helpers for window size w.
+    n_states = 1 << w
+    state_mask = (1 << w) - 1
+    states = np.arange(n_states, dtype=np.uint32)
+    next_state0 = ((states << np.uint32(1)) & np.uint32(state_mask)).astype(np.intp)
+    next_state1 = (next_state0 | np.intp(1)).astype(np.intp)
+
+    # state bit 0 corresponds to x[j-1], bit 1 to x[j-2], ... bit (w-1) to x[j-w]
+    contrib_mask = 0
+    for d in range(1, w + 1):
+        if ((c >> d) & 1) == 1:
+            contrib_mask |= 1 << (d - 1)
+    contrib_mask_u32 = np.uint32(contrib_mask)
+
+    # sum_state[state] = popcount(state & contrib_mask)
+    sum_state = np.fromiter(
+        (int(s & contrib_mask_u32).bit_count() for s in states),
+        dtype=np.uint8,
+        count=n_states,
+    ).astype(np.int16)
+
+    # dp[state, carry]
+    dp = np.zeros((n_states, max_carry + 1), dtype=np.float64)
+    dp[0, 0] = 1.0
+    dp_next = np.zeros_like(dp)
+
+    probs = np.zeros(NBITS, dtype=np.float64)
+    binom_pmfs = _binom_pmf_half(max_carry)
+
+    for j in range(NBITS):
+        dp_next.fill(0.0)
+        p_y1 = 0.0
+
+        # Total contributors in column j is popcount(c & ((1<<(j+1))-1))
+        total = (c & ((1 << (j + 1)) - 1)).bit_count()
+
+        # Handle the conditioned contributor exactly (if it lands in this column).
+        t_fixed = j - input_bit
+        fixed_out = 0
+        if 0 <= t_fixed < NBITS and ((c >> t_fixed) & 1) == 1:
+            if t_fixed > w:
+                fixed_out = x_value
+                total -= 1
+
+        # Remove in-window (d=1..w) contributors from the out-of-window binomial count.
+        # (And remove bit0 contributor from "out" since it is handled by x_j below.)
+        in_window = (c & ((1 << (min(w, j) + 1)) - 1)).bit_count() - c0
+        n_out = total - c0 - in_window
+        if n_out < 0:
+            n_out = 0
+
+        pmf = binom_pmfs[n_out]
+        tvals = np.arange(n_out + 1, dtype=np.int16)
+
+        # x_j distribution: fixed if j==input_bit, else uniform.
+        if j == input_bit:
+            x_cases = ((x_value, 1.0),)
+        else:
+            x_cases = ((0, 0.5), (1, 0.5))
+
+        n_carry = max_carry + 1
+        carry_vals = np.arange(n_carry, dtype=np.int16)[None, :]
+        dp_next_flat = dp_next.ravel()
+        carry_stride = n_carry
+
+        for xj, px in x_cases:
+            base = sum_state + fixed_out
+            if c0 == 1:
+                base = base + int(xj)
+
+            # Update carry distribution and y[j] parity.
+            for t, pt in zip(tvals, pmf):
+                if pt == 0.0:
+                    continue
+                b = (base + int(t)).astype(np.int16)
+                total_mat = b[:, None] + carry_vals
+                parity = (total_mat & 1).astype(np.float64)
+                carry_out = (total_mat >> 1).astype(np.int16)
+
+                wgt = dp * (px * float(pt))
+                p_y1 += float(np.sum(wgt * parity))
+
+                # Accumulate dp_next into (next_state, carry_out) with one scatter-add.
+                # next_state is many-to-one, so use np.add.at.
+                ns = next_state1 if xj == 1 else next_state0
+                idx = ns[:, None] * carry_stride + carry_out.astype(np.intp)
+                np.add.at(dp_next_flat, idx.ravel(), wgt.ravel())
+
+        probs[j] = p_y1
+        dp, dp_next = dp_next, dp
+
+    return probs
+
+
 def estimate_multiply(constant: int) -> AvalancheArray:
     """Estimate avalanche for y = x * constant.
 
@@ -1293,11 +1480,11 @@ def estimate_multiply(constant: int) -> AvalancheArray:
     - Match `exact_model_multiply` closely for small NBITS (where we can verify).
     - Scale to NBITS=64 without O(2**NBITS) work.
 
-    Approach:
-    - For small NBITS, defer to `exact_model_multiply` (exact and fast enough).
-    - For larger NBITS, estimate the conditional bit probabilities
-      P(y[j]=1 | x[i]=0/1) via vectorized sampling, and then reuse the same
-      carry-propagation model used by `exact_model_multiply`.
+        Approach:
+        - For small NBITS, defer to `exact_model_multiply` (exact and fast enough).
+        - For larger NBITS, compute an analytical approximation for the conditional bit
+            probabilities P(y[j]=1 | x[i]=0/1) using a deterministic carry DP driven by
+            Binomial distributions.
 
     Notes:
     - Multiplication by an odd constant can be represented as repeated add_shift
@@ -1311,12 +1498,30 @@ def estimate_multiply(constant: int) -> AvalancheArray:
     if c == 1:
         return identity(NBITS)
 
+    # -1 mod 2**NBITS: y = (-x) = (~x + 1). This matches the add(+1) avalanche exactly.
+    if c == mask:
+        return estimate_add(1)
+
     # For NBITS small, use the exact reference model (matches what we validate against).
-    if NBITS <= 16:
+    # Keep this limited so that NBITS=16 can be used to compare estimator vs model.
+    if NBITS <= 8:
         return exact_model_multiply(c)
 
-    # Sample size tuned for speed/quality; callers can bump this if desired.
-    n_samples = 2_000_000
+    # Exact fast paths for especially hard cases.
+    if c != 0 and (c & (c - 1)) == 0:
+        # power of two: left shift
+        shift = int(c.bit_length() - 1)
+        out = np.zeros((NBITS, NBITS), dtype=np.float64)
+        for i in range(NBITS):
+            j = i + shift
+            if j < NBITS:
+                out[i, j] = 1.0
+        return out
+
+    if (c & 1) == 1 and c.bit_count() == 2:
+        # c = 1 + 2**s => y = x + (x<<s)
+        s = int((c ^ 1).bit_length() - 1)
+        return estimate_add_shift(s)
 
     avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
 
@@ -1348,20 +1553,8 @@ def estimate_multiply(constant: int) -> AvalancheArray:
         delta = (c << input_bit) & mask
         neg_delta = ((-int(delta)) & mask)
 
-        # Sample x_rest with x[input_bit]=0.
-        x0 = getRandomInputs(n_samples).astype(np.uint64) & np.uint64(mask)
-        x0 &= ~(np.uint64(1) << np.uint64(input_bit))
-        x1 = x0 | (np.uint64(1) << np.uint64(input_bit))
-
-        y0 = (x0 * np.uint64(c)) & np.uint64(mask)
-        y1 = (x1 * np.uint64(c)) & np.uint64(mask)
-
-        probs_y_given_0 = np.zeros(NBITS, dtype=np.float64)
-        probs_y_given_1 = np.zeros(NBITS, dtype=np.float64)
-        for j in range(NBITS):
-            bit = np.uint64(1) << np.uint64(j)
-            probs_y_given_0[j] = float(np.mean((y0 & bit) != 0))
-            probs_y_given_1[j] = float(np.mean((y1 & bit) != 0))
+        probs_y_given_0 = _approx_conditional_y_probs_multiply(c, input_bit, x_value=0)
+        probs_y_given_1 = _approx_conditional_y_probs_multiply(c, input_bit, x_value=1)
 
         add_probs = compute_flip_probs(delta, probs_y_given_0)
         sub_probs = compute_flip_probs(neg_delta, probs_y_given_1)

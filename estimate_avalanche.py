@@ -37,21 +37,33 @@ def getRandomInputs(n: int) -> Inputs:
     return np.random.randint(0, 2**64, size=n, dtype=np.uint64)
 
 
-def calculate_avalanche(operation: op, n: int) -> AvalancheArrayMeanP95:
+def get_all_inputs() -> Inputs:
+    """Generate all possible NBITS-bit inputs.
+
+    Note: This enumerates values in the range [0, 2**NBITS). It is *not* feasible to
+    enumerate all 64-bit inputs.
+    """
+    return np.arange(0, 2**NBITS, dtype=np.uint64)
+
+
+def calculate_avalanche_for_input(operation: op, inputs: Inputs) -> AvalancheArrayMeanP95:
     """Calculate the actual avalanche property of an operation over n inputs.
 
     Returns a 64x64 array where element [i, j] represents the probability that
     flipping input bit i will cause output bit j to flip.
     """
+    n = inputs.shape[0]
+
+    # Compute once so per-bit workers compare against the same baseline.
+    # This also avoids recomputing operation(inputs) NBITS times.
+    original_outputs = operation(inputs)
+
     # Initialize avalanche matrix
     avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
 
     # Parallelize over input bits using the pool
     def process_bit(input_bit: int) -> Tuple[int, npt.NDArray[np.float64]]:
         """Process a single input bit and return its avalanche row."""
-        inputs = getRandomInputs(n)
-        original_outputs = operation(inputs)
-
         # Create flipped inputs by XORing with a mask that flips this bit
         flipped_inputs = inputs ^ (np.uint64(1) << input_bit)
         flipped_outputs = operation(flipped_inputs)
@@ -81,6 +93,28 @@ def calculate_avalanche(operation: op, n: int) -> AvalancheArrayMeanP95:
     lower_p95, upper_p95, _, _ = wilson_interval(avalanche, n, z=1.96)
     return [avalanche, lower_p95, upper_p95]
 
+
+def calculate_avalanche(operation: op, n: int) -> AvalancheArrayMeanP95:
+    """Calculate the actual avalanche property of an operation over n random inputs.
+
+    Returns a 64x64 array where element [i, j] represents the probability that
+    flipping input bit i will cause output bit j to flip.
+    """
+    inputs = getRandomInputs(n)
+    return calculate_avalanche_for_input(operation, inputs)
+
+def exact_avalanche(operation: op) -> AvalancheArray:
+    """Calculate the exact avalanche property over all possible NBITS-bit inputs.
+
+    Returns a 64x64 array where element [i, j] represents the probability that
+    flipping input bit i will cause output bit j to flip.
+
+    Note: With the current configuration, this is exact over the domain
+    {0, 1, ..., 2**NBITS - 1}. It is not an exhaustive 64-bit evaluation.
+    """
+    inputs = get_all_inputs()
+    avalanche, _, _ = calculate_avalanche_for_input(operation, inputs)
+    return avalanche
 
 def wilson_interval(
     p_hat: AvalancheArray,
@@ -372,76 +406,18 @@ def compute_conditional_y_probs_add(constant: int, input_bit: int) -> tuple:
 
 
 def exact_model_add(constant: int) -> AvalancheArray:
-    """Compute the exact avalanche matrix for adding a constant.
+    """Exact model for the avalanche effect of adding a constant.
     
-    When flipping input bit i in (x + constant):
-    - If x[i] was 0, we're adding (1 << i) to x, so y changes by adding (1 << i)
-    - If x[i] was 1, we're subtracting (1 << i) from x, so y changes by subtracting (1 << i)
+    This function computes the exact avalanche matrix for the operation
+    y = x + constant, where x is a uniform random NBITS-bit integer.
     
-    The analysis uses exact conditional probability computation:
-    - For each input bit i, we compute P(y[j]=1 | x[i]=0) and P(y[j]=1 | x[i]=1)
-    - These probabilities track carry propagation to compute flip probabilities
+    The model is based on analyzing how flipping each input bit affects
+    the output bits through carry propagation in addition.
     
     Args:
         constant: The constant to add
-    
-    Returns:
-        A NBITS x NBITS matrix where element [i, j] represents the probability
-        that flipping input bit i will cause output bit j to flip.
     """
-    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
-    mask = (1 << NBITS) - 1
-    
-    for input_bit in range(NBITS):
-        delta = (1 << input_bit) & mask
-        neg_delta = ((-delta) & mask)  # Two's complement for subtraction
-        
-        # Get the conditional probabilities for y bits given x[input_bit]
-        probs_y_given_0, probs_y_given_1 = compute_conditional_y_probs_add(constant, input_bit)
-        
-        def compute_flip_probs(delta_val: int, y_probs: np.ndarray) -> list:
-            """Compute flip probabilities when adding delta_val to y.
-            
-            y[j] has P(y[j]=1) = y_probs[j]
-            """
-            probs = [0.0] * NBITS
-            delta_bits = [(delta_val >> j) & 1 for j in range(NBITS)]
-            
-            # Track P(carry into position j)
-            P_carry = 0.0
-            
-            for j in range(NBITS):
-                d = delta_bits[j]
-                P_y1 = y_probs[j]
-                P_y0 = 1.0 - P_y1
-                P_c0 = 1.0 - P_carry
-                P_c1 = P_carry
-                
-                # When adding d + carry_in to y[j]:
-                # flip occurs when (d + carry_in) is odd
-                
-                if d == 0:
-                    probs[j] = P_c1
-                    # Carry out occurs when y[j]=1 AND carry_in=1
-                    P_carry = P_y1 * P_c1
-                else:  # d == 1
-                    probs[j] = P_c0
-                    # Carry out when y[j]=0 AND carry_in=1, OR y[j]=1
-                    P_carry = P_y0 * P_c1 + P_y1
-            
-            return probs
-        
-        # ADD case: x[input_bit] was 0, now 1, so we add delta to y
-        add_probs = compute_flip_probs(delta, probs_y_given_0)
-        
-        # SUB case: x[input_bit] was 1, now 0, so we subtract delta (add neg_delta) from y
-        sub_probs = compute_flip_probs(neg_delta, probs_y_given_1)
-        
-        # Combined: 50% each case (x[input_bit] is 0 or 1 with equal probability)
-        for j in range(NBITS):
-            avalanche[input_bit, j] = 0.5 * add_probs[j] + 0.5 * sub_probs[j]
-    
-    return avalanche
+    return exact_avalanche(lambda inputs: (inputs + np.uint64(constant)))
 
 
 def test_add_exhaustive(constant: int) -> bool:
@@ -1115,28 +1091,7 @@ def exact_model_add_shift(shift: int) -> AvalancheArray:
         A NBITS x NBITS matrix where element [i, j] represents the probability
         that flipping input bit i will cause output bit j to flip.
     """
-    mask = (1 << NBITS) - 1
-    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
-    
-    # Special case: shift = 0 means x + x = 2*x = x << 1
-    # This is just a left shift by 1, which has a simple pattern
-    
-    for input_bit in range(NBITS):
-        flip_counts = np.zeros(NBITS, dtype=np.int64)
-        
-        for x in range(1 << NBITS):
-            y_original = (x + (x << shift)) & mask
-            x_flipped = x ^ (1 << input_bit)
-            y_flipped = (x_flipped + (x_flipped << shift)) & mask
-            
-            diff = y_original ^ y_flipped
-            for j in range(NBITS):
-                if (diff >> j) & 1:
-                    flip_counts[j] += 1
-        
-        avalanche[input_bit, :] = flip_counts / (1 << NBITS)
-    
-    return avalanche
+    return exact_avalanche(lambda x: x + (x << np.uint64(shift)))
 
 def test_add_shift(shift: int, n: int) -> float:
     """Test the avalanche effect of an XOR operation with a constant."""
@@ -1185,383 +1140,11 @@ def exact_model_multiply(constant: int) -> AvalancheArray:
         A NBITS x NBITS matrix where element [i, j] represents the probability
         that flipping input bit i will cause output bit j to flip.
     """
-    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
-    
-    # Special case: multiplying by 0 always gives 0, no bits flip
-    if constant == 0:
-        return avalanche
-    
-    # Mask for modular arithmetic  
-    mask = (1 << NBITS) - 1
-    
-    for input_bit in range(NBITS):
-        delta = (constant << input_bit) & mask
-        neg_delta = ((-int(delta)) & mask)  # Two's complement for subtraction
-        
-        # Get the conditional probabilities for y bits given x[input_bit]
-        probs_y_given_0, probs_y_given_1 = compute_conditional_y_probs(constant, input_bit)
-        
-        def compute_flip_probs(delta_val: int, y_probs: np.ndarray) -> list:
-            """Compute flip probabilities when adding delta_val to y.
-            
-            y[j] has P(y[j]=1) = y_probs[j]
-            """
-            probs = [0.0] * NBITS
-            delta_bits = [(delta_val >> j) & 1 for j in range(NBITS)]
-            
-            # Track P(carry into position j)
-            P_carry = 0.0
-            
-            for j in range(NBITS):
-                d = delta_bits[j]
-                P_y1 = y_probs[j]
-                P_y0 = 1.0 - P_y1
-                P_c0 = 1.0 - P_carry
-                P_c1 = P_carry
-                
-                # When adding d + carry_in to y[j]:
-                # flip occurs when (d + carry_in) is odd
-                
-                if d == 0:
-                    probs[j] = P_c1
-                    # Carry out occurs when y[j]=1 AND carry_in=1
-                    P_carry = P_y1 * P_c1
-                else:  # d == 1
-                    probs[j] = P_c0
-                    # Carry out when y[j]=0 AND carry_in=1, OR y[j]=1
-                    P_carry = P_y0 * P_c1 + P_y1
-            
-            return probs
-        
-        # ADD case: x[input_bit] = 0, use probs_y_given_0
-        add_probs = compute_flip_probs(delta, probs_y_given_0)
-        
-        # SUB case: x[input_bit] = 1, use probs_y_given_1
-        sub_probs = compute_flip_probs(neg_delta, probs_y_given_1)
-        
-        # Combined: 50% each case (x[input_bit] is 0 or 1 with equal probability)
-        for j in range(NBITS):
-            avalanche[input_bit, j] = 0.5 * add_probs[j] + 0.5 * sub_probs[j]
-    
-    return avalanche
-
-
-@lru_cache(maxsize=None)
-def _odd_multiplier_add_shift_chain(constant: int, nbits: int) -> tuple[int, ...]:
-    """Factor an odd multiplier into (1 + 2**s) factors modulo 2**nbits.
-
-    The operation y = x + (x << s) is multiplication by (1 + 2**s) modulo 2**nbits.
-    For any odd constant c and any nbits >= 1, there is a simple constructive
-    factorization into these generators where each shift s in [1, nbits-1] is used
-    at most once.
-
-    Construction (bit-fixing):
-        Maintain an odd running product v (starting at 1). For t=1..nbits-1:
-        if bit t of v differs from bit t of c, multiply v by (1 + 2**t).
-
-        Key property: for odd v, v*(1+2**t) ≡ v + 2**t (mod 2**(t+1)),
-        so this toggles bit t without changing any lower bits.
-    """
-    if nbits <= 0:
-        raise ValueError(f"nbits must be positive, got {nbits}")
-
-    mod = 1 << nbits
-    target = int(constant) & (mod - 1)
-    if target % 2 == 0:
-        raise ValueError(f"constant must be odd, got {constant}")
-    if target == 1:
-        return ()
-
-    v = 1
-    chain: list[int] = []
-    for t in range(1, nbits):
-        if ((v >> t) & 1) != ((target >> t) & 1):
-            v = (v * (1 + (1 << t))) & (mod - 1)
-            chain.append(t)
-
-    if v != target:
-        raise RuntimeError(
-            f"bit-fixing chain construction failed for {target} (nbits={nbits}); got {v}"
-        )
-    return tuple(chain)
-
-
-@lru_cache(maxsize=None)
-def _binom_pmf_half(max_n: int) -> tuple[npt.NDArray[np.float64], ...]:
-    """Binomial(n, 0.5) pmfs for n=0..max_n."""
-    if max_n < 0:
-        raise ValueError(f"max_n must be >= 0, got {max_n}")
-
-    pmfs: list[npt.NDArray[np.float64]] = []
-    # n=0
-    pmfs.append(np.array([1.0], dtype=np.float64))
-    for n in range(1, max_n + 1):
-        prev = pmfs[-1]
-        cur = np.empty(n + 1, dtype=np.float64)
-        cur[0] = 0.5 * prev[0]
-        cur[-1] = 0.5 * prev[-1]
-        cur[1:-1] = 0.5 * (prev[:-1] + prev[1:])
-        pmfs.append(cur)
-    return tuple(pmfs)
-
-
-def _approx_conditional_y_probs_multiply(
-    constant: int,
-    input_bit: int,
-    *,
-    x_value: int,
-) -> npt.NDArray[np.float64]:
-    """Approximate P(y[j]=1 | x[input_bit]=x_value) for y = x*constant (mod 2**NBITS).
-
-    This is a deterministic analytical approximation intended to scale to NBITS=64,
-    while being much more accurate for "hard" cases (e.g. small shifts like 3x).
-
-    Compared to a carry-only Binomial model, this uses a *windowed* carry DP which
-    tracks the last W input bits that can be shared between the current column sum
-    and the carry-in, capturing the dominant dependency.
-
-    If W >= msb(constant), this DP is exact for the conditional output-bit marginals.
-    """
-    if x_value not in (0, 1):
-        raise ValueError(f"x_value must be 0 or 1, got {x_value}")
-    if not (0 <= input_bit < NBITS):
-        raise ValueError(f"input_bit must be in [0, {NBITS - 1}], got {input_bit}")
-
-    mask = (1 << NBITS) - 1
-    c = int(constant) & mask
-    if c == 0:
-        return np.zeros(NBITS, dtype=np.float64)
-
-    # Choose a window that is exact for small-msb constants, and bounded for scalability.
-    msb = c.bit_length() - 1
-    window_max = 4
-    w = min(msb, window_max)
-
-    # carry is bounded by popcount(c)
-    max_carry = c.bit_count()
-    c0 = c & 1
-
-    if w == 0:
-        # Fallback: carry-only Binomial model (no dependency tracking).
-        binom_pmfs = _binom_pmf_half(max_carry)
-        carry_dist = np.zeros(max_carry + 1, dtype=np.float64)
-        carry_dist[0] = 1.0
-        probs = np.zeros(NBITS, dtype=np.float64)
-
-        prefix_mask = 0
-        for j in range(NBITS):
-            prefix_mask |= (1 << j)
-            total = (c & prefix_mask).bit_count()
-            r = total
-
-            # Remove the conditioned contributor if it lands in this column.
-            t_fixed = j - input_bit
-            fixed = 0
-            if 0 <= t_fixed < NBITS and ((c >> t_fixed) & 1) == 1:
-                fixed = x_value
-                r -= 1
-
-            pmf = binom_pmfs[r]
-            tvals = np.arange(r + 1, dtype=np.uint16)
-
-            next_carry = np.zeros_like(carry_dist)
-            p_y1 = 0.0
-            for carry_in, p_c in enumerate(carry_dist):
-                if p_c == 0.0:
-                    continue
-                sums = carry_in + fixed + tvals
-                p_y1 += p_c * float(np.dot(pmf, (sums & 1)))
-                carry_out = (sums >> 1).astype(np.int64)
-                np.add.at(next_carry, carry_out, p_c * pmf)
-
-            probs[j] = p_y1
-            carry_dist = next_carry
-
-        return probs
-
-    # Precompute state helpers for window size w.
-    n_states = 1 << w
-    state_mask = (1 << w) - 1
-    states = np.arange(n_states, dtype=np.uint32)
-    next_state0 = ((states << np.uint32(1)) & np.uint32(state_mask)).astype(np.intp)
-    next_state1 = (next_state0 | np.intp(1)).astype(np.intp)
-
-    # state bit 0 corresponds to x[j-1], bit 1 to x[j-2], ... bit (w-1) to x[j-w]
-    contrib_mask = 0
-    for d in range(1, w + 1):
-        if ((c >> d) & 1) == 1:
-            contrib_mask |= 1 << (d - 1)
-    contrib_mask_u32 = np.uint32(contrib_mask)
-
-    # sum_state[state] = popcount(state & contrib_mask)
-    sum_state = np.fromiter(
-        (int(s & contrib_mask_u32).bit_count() for s in states),
-        dtype=np.uint8,
-        count=n_states,
-    ).astype(np.int16)
-
-    # dp[state, carry]
-    dp = np.zeros((n_states, max_carry + 1), dtype=np.float64)
-    dp[0, 0] = 1.0
-    dp_next = np.zeros_like(dp)
-
-    probs = np.zeros(NBITS, dtype=np.float64)
-    binom_pmfs = _binom_pmf_half(max_carry)
-
-    for j in range(NBITS):
-        dp_next.fill(0.0)
-        p_y1 = 0.0
-
-        # Total contributors in column j is popcount(c & ((1<<(j+1))-1))
-        total = (c & ((1 << (j + 1)) - 1)).bit_count()
-
-        # Handle the conditioned contributor exactly (if it lands in this column).
-        t_fixed = j - input_bit
-        fixed_out = 0
-        if 0 <= t_fixed < NBITS and ((c >> t_fixed) & 1) == 1:
-            if t_fixed > w:
-                fixed_out = x_value
-                total -= 1
-
-        # Remove in-window (d=1..w) contributors from the out-of-window binomial count.
-        # (And remove bit0 contributor from "out" since it is handled by x_j below.)
-        in_window = (c & ((1 << (min(w, j) + 1)) - 1)).bit_count() - c0
-        n_out = total - c0 - in_window
-        if n_out < 0:
-            n_out = 0
-
-        pmf = binom_pmfs[n_out]
-        tvals = np.arange(n_out + 1, dtype=np.int16)
-
-        # x_j distribution: fixed if j==input_bit, else uniform.
-        if j == input_bit:
-            x_cases = ((x_value, 1.0),)
-        else:
-            x_cases = ((0, 0.5), (1, 0.5))
-
-        n_carry = max_carry + 1
-        carry_vals = np.arange(n_carry, dtype=np.int16)[None, :]
-        dp_next_flat = dp_next.ravel()
-        carry_stride = n_carry
-
-        for xj, px in x_cases:
-            base = sum_state + fixed_out
-            if c0 == 1:
-                base = base + int(xj)
-
-            # Update carry distribution and y[j] parity.
-            for t, pt in zip(tvals, pmf):
-                if pt == 0.0:
-                    continue
-                b = (base + int(t)).astype(np.int16)
-                total_mat = b[:, None] + carry_vals
-                parity = (total_mat & 1).astype(np.float64)
-                carry_out = (total_mat >> 1).astype(np.int16)
-
-                wgt = dp * (px * float(pt))
-                p_y1 += float(np.sum(wgt * parity))
-
-                # Accumulate dp_next into (next_state, carry_out) with one scatter-add.
-                # next_state is many-to-one, so use np.add.at.
-                ns = next_state1 if xj == 1 else next_state0
-                idx = ns[:, None] * carry_stride + carry_out.astype(np.intp)
-                np.add.at(dp_next_flat, idx.ravel(), wgt.ravel())
-
-        probs[j] = p_y1
-        dp, dp_next = dp_next, dp
-
-    return probs
+    return exact_avalanche(lambda x: x * np.uint64(constant))
 
 
 def estimate_multiply(constant: int) -> AvalancheArray:
-    """Estimate avalanche for y = x * constant.
-
-    Design goals:
-    - Match `exact_model_multiply` closely for small NBITS (where we can verify).
-    - Scale to NBITS=64 without O(2**NBITS) work.
-
-        Approach:
-        - For small NBITS, defer to `exact_model_multiply` (exact and fast enough).
-        - For larger NBITS, compute an analytical approximation for the conditional bit
-            probabilities P(y[j]=1 | x[i]=0/1) using a deterministic carry DP driven by
-            Binomial distributions.
-
-    Notes:
-    - Multiplication by an odd constant can be represented as repeated add_shift
-      operations, but composing avalanche matrices via `combine_avalanche` is not
-      accurate enough because intermediate bit flips are correlated.
-    """
-    mask = (1 << NBITS) - 1
-    c = int(constant) & mask
-    if c == 0:
-        return np.zeros((NBITS, NBITS), dtype=np.float64)
-    if c == 1:
-        return identity(NBITS)
-
-    # -1 mod 2**NBITS: y = (-x) = (~x + 1). This matches the add(+1) avalanche exactly.
-    if c == mask:
-        return estimate_add(1)
-
-    # For NBITS small, use the exact reference model (matches what we validate against).
-    # Keep this limited so that NBITS=16 can be used to compare estimator vs model.
-    if NBITS <= 8:
-        return exact_model_multiply(c)
-
-    # Exact fast paths for especially hard cases.
-    if c != 0 and (c & (c - 1)) == 0:
-        # power of two: left shift
-        shift = int(c.bit_length() - 1)
-        out = np.zeros((NBITS, NBITS), dtype=np.float64)
-        for i in range(NBITS):
-            j = i + shift
-            if j < NBITS:
-                out[i, j] = 1.0
-        return out
-
-    if (c & 1) == 1 and c.bit_count() == 2:
-        # c = 1 + 2**s => y = x + (x<<s)
-        s = int((c ^ 1).bit_length() - 1)
-        return estimate_add_shift(s)
-
-    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
-
-    def compute_flip_probs(delta_val: int, y_probs: npt.NDArray[np.float64]) -> list[float]:
-        """Compute flip probabilities when adding delta_val to a value y.
-
-        This reuses the same marginal-carry approximation as `exact_model_multiply`.
-        """
-        probs = [0.0] * NBITS
-        delta_bits = [(delta_val >> j) & 1 for j in range(NBITS)]
-
-        P_carry = 0.0
-        for j in range(NBITS):
-            d = delta_bits[j]
-            P_y1 = float(y_probs[j])
-            P_y0 = 1.0 - P_y1
-            P_c0 = 1.0 - P_carry
-            P_c1 = P_carry
-
-            if d == 0:
-                probs[j] = P_c1
-                P_carry = P_y1 * P_c1
-            else:
-                probs[j] = P_c0
-                P_carry = P_y0 * P_c1 + P_y1
-        return probs
-
-    for input_bit in range(NBITS):
-        delta = (c << input_bit) & mask
-        neg_delta = ((-int(delta)) & mask)
-
-        probs_y_given_0 = _approx_conditional_y_probs_multiply(c, input_bit, x_value=0)
-        probs_y_given_1 = _approx_conditional_y_probs_multiply(c, input_bit, x_value=1)
-
-        add_probs = compute_flip_probs(delta, probs_y_given_0)
-        sub_probs = compute_flip_probs(neg_delta, probs_y_given_1)
-        for j in range(NBITS):
-            avalanche[input_bit, j] = 0.5 * add_probs[j] + 0.5 * sub_probs[j]
-
-    return avalanche
+    return identity(NBITS)
 
 def test_multiply(constant: int, n: int) -> tuple[float, float, float, float, float]:
     """Test the avalanche effect of an XOR operation with a constant."""

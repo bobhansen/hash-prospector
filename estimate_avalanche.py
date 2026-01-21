@@ -17,7 +17,7 @@ AvalancheArray: TypeAlias = npt.NDArray[np.float64]
 AvalancheArrayMeanP95: TypeAlias = Tuple[AvalancheArray, AvalancheArray, AvalancheArray]
 Inputs: TypeAlias = npt.NDArray[np.uint64]  # 1D array of uint64 values
 
-NBITS = 32
+NBITS = 64
 
 pool = ThreadPoolExecutor()
 
@@ -114,15 +114,17 @@ def z_scores_from_samples(
     """Compute per-cell z-scores comparing an estimate to sampled proportions.
 
     We use the Wilson interval to derive a stable standard error estimate even
-    when observed proportions are 0 or 1.
+    when observed proportions are 0 or 1, but compute the residual against the
+    raw observed proportion p̂ (not the Wilson center) so that the mean z-score
+    is interpretable as an (approximate) unbiasedness check.
 
     Returns:
         zscore matrix with same shape as inputs.
     """
-    _, _, center, se = wilson_interval(observed, n, z=z)
+    _, _, _, se = wilson_interval(observed, n, z=z)
     # Avoid divide-by-zero (shouldn't happen for finite n, but keep it safe).
     safe_se = np.where(se > 0.0, se, np.inf)
-    return (estimated - center) / safe_se
+    return (estimated - observed) / safe_se
 
 
 def zscore_summary(zmat: AvalancheArray) -> tuple[float, float, float, float]:
@@ -729,7 +731,7 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
     # exactly by tracking just those overlap bits.
     if shift <= (NBITS // 2):
         overlap = NBITS - 2 * shift
-        if overlap <= 12:
+        if overlap <= 8:
             return _estimate_add_shift_overlap_dp(shift, overlap)
 
     # We compute rows exactly via dynamic programming over a compact state:
@@ -746,7 +748,7 @@ def estimate_add_shift(shift: int) -> AvalancheArray:
 
     # For larger widths, fall back to a carry Markov model that runs in O(NBITS^2).
     # For shift > NBITS/2 this is exact; otherwise it's an approximation.
-    if width > 12:
+    if width > 8:
         return _estimate_add_shift_markov(shift)
 
     pre = _add_shift_precompute(NBITS, shift)
@@ -922,6 +924,56 @@ def _estimate_add_shift_markov(shift: int) -> AvalancheArray:
     return avalanche
 
 
+@lru_cache(maxsize=None)
+def _overlap_dp_precompute(overlap: int) -> tuple[
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint32],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+]:
+    if overlap <= 0:
+        raise ValueError(f"overlap must be > 0, got {overlap}")
+
+    n_states = 1 << overlap
+    states = np.arange(n_states, dtype=np.uint32)
+
+    # b_fixed_by_read_idx[read_idx, state] = (state >> read_idx) & 1
+    b_fixed_by_read_idx = np.empty((overlap, n_states), dtype=np.uint8)
+    for read_idx in range(overlap):
+        b_fixed_by_read_idx[read_idx] = ((states >> np.uint32(read_idx)) & 1).astype(np.uint8)
+
+    # next_state_if_write[write_idx, state] = state | (1<<write_idx)
+    next_state_if_write = np.empty((overlap, n_states), dtype=np.uint32)
+    for write_idx in range(overlap):
+        next_state_if_write[write_idx] = states | (np.uint32(1) << np.uint32(write_idx))
+
+    # Precompute carry-pair transitions and output-bit flips for all toggle combinations.
+    # next_cp[ta, tb, cp_idx, a, b] and flip[ta, tb, cp_idx, a, b]
+    carry_pairs = ((0, 0), (0, 1), (1, 0), (1, 1))
+    next_cp = np.empty((2, 2, 4, 2, 2), dtype=np.uint8)
+    flip = np.empty((2, 2, 4, 2, 2), dtype=np.uint8)
+
+    def carry_out(a: int, b: int, c: int) -> int:
+        return (a & b) | (a & c) | (b & c)
+
+    for ta in (0, 1):
+        for tb in (0, 1):
+            for cp_idx, (c, cp) in enumerate(carry_pairs):
+                for a in (0, 1):
+                    for b in (0, 1):
+                        ap = a ^ ta
+                        bp = b ^ tb
+                        s0 = a ^ b ^ c
+                        s1 = ap ^ bp ^ cp
+                        flip[ta, tb, cp_idx, a, b] = np.uint8(1 if s0 != s1 else 0)
+
+                        co0 = carry_out(a, b, c)
+                        co1 = carry_out(ap, bp, cp)
+                        next_cp[ta, tb, cp_idx, a, b] = np.uint8((co0 << 1) | co1)
+
+    return b_fixed_by_read_idx, next_state_if_write, next_cp, flip
+
+
 def _estimate_add_shift_overlap_dp(shift: int, overlap: int) -> AvalancheArray:
     """Exact avalanche for y = x + (x<<shift) when overlap = NBITS-2*shift is small.
 
@@ -938,15 +990,13 @@ def _estimate_add_shift_overlap_dp(shift: int, overlap: int) -> AvalancheArray:
     n_states = 1 << overlap
     avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
 
-    # carry-pair state index: (c<<1) | c'
-    carry_pairs = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    b_fixed_by_read_idx, next_state_if_write, next_cp, flip = _overlap_dp_precompute(overlap)
 
-    def carry_out(a: int, b: int, c: int) -> int:
-        return (a & b) | (a & c) | (b & c)
+    dp = np.zeros((n_states, 4), dtype=np.float64)
+    dp_next = np.zeros((n_states, 4), dtype=np.float64)
 
     for input_bit in range(NBITS):
-        dp = np.zeros((n_states, 4), dtype=np.float64)
-        dp_next = np.zeros((n_states, 4), dtype=np.float64)
+        dp.fill(0.0)
         dp[0, 0] = 1.0
 
         toggle_b_bit = input_bit + shift
@@ -954,60 +1004,71 @@ def _estimate_add_shift_overlap_dp(shift: int, overlap: int) -> AvalancheArray:
         for j in range(NBITS):
             dp_next.fill(0.0)
 
-            b_mode: str
+            ta = 1 if j == input_bit else 0
+            tb = 1 if (toggle_b_bit < NBITS and j == toggle_b_bit) else 0
+
+            b_kind = 0
             read_idx = -1
             if j < shift:
-                b_mode = "const0"
+                b_kind = 0  # const0
             elif j < 2 * shift:
-                b_mode = "random"
+                b_kind = 1  # random
             else:
-                b_mode = "state"
+                b_kind = 2  # state
                 read_idx = j - 2 * shift
+                b_fixed_vec = b_fixed_by_read_idx[read_idx]
 
-            write_idx = -1
-            do_write = False
-            if shift <= j < (shift + overlap):
-                do_write = True
-                write_idx = j - shift
+            do_write = (shift <= j < (shift + overlap))
+            write_idx = (j - shift) if do_write else -1
+            next_state_if_write_vec = next_state_if_write[write_idx] if do_write else None
 
             for state in range(n_states):
-                if b_mode == "state":
-                    b_fixed = (state >> read_idx) & 1
+                if b_kind == 2:
+                    b_fixed = int(b_fixed_vec[state])
 
-                for cp_idx, (c, cp) in enumerate(carry_pairs):
+                for cp_idx in range(4):
                     p_in = dp[state, cp_idx]
                     if p_in == 0.0:
                         continue
 
-                    for a in (0, 1):
-                        wa = 0.5
-                        ap = a ^ (1 if j == input_bit else 0)
+                    if b_kind == 0:
+                        # b is constant 0
+                        for a in (0, 1):
+                            if flip[ta, tb, cp_idx, a, 0]:
+                                avalanche[input_bit, j] += p_in * 0.5
 
-                        if b_mode == "const0":
-                            b_values = ((0, 1.0),)
-                        elif b_mode == "random":
-                            b_values = ((0, 0.5), (1, 0.5))
-                        else:
-                            b_values = ((b_fixed, 1.0),)
-
-                        for b, wb in b_values:
-                            w = wa * wb
-                            bp = b ^ (1 if (toggle_b_bit < NBITS and j == toggle_b_bit) else 0)
-
-                            s0 = a ^ b ^ c
-                            s1 = ap ^ bp ^ cp
-                            if s0 != s1:
-                                avalanche[input_bit, j] += p_in * w
-
-                            co0 = carry_out(a, b, c)
-                            co1 = carry_out(ap, bp, cp)
-                            next_cp = (co0 << 1) | co1
-
-                            next_state = state
+                            cp_next = int(next_cp[ta, tb, cp_idx, a, 0])
                             if do_write and a == 1:
-                                next_state = state | (1 << write_idx)
+                                dp_next[int(next_state_if_write_vec[state]), cp_next] += p_in * 0.5
+                            else:
+                                dp_next[state, cp_next] += p_in * 0.5
 
-                            dp_next[next_state, next_cp] += p_in * w
+                    elif b_kind == 1:
+                        # b is uniform random
+                        for a in (0, 1):
+                            w = 0.25
+                            for b in (0, 1):
+                                if flip[ta, tb, cp_idx, a, b]:
+                                    avalanche[input_bit, j] += p_in * w
+
+                                cp_next = int(next_cp[ta, tb, cp_idx, a, b])
+                                if do_write and a == 1:
+                                    dp_next[int(next_state_if_write_vec[state]), cp_next] += p_in * w
+                                else:
+                                    dp_next[state, cp_next] += p_in * w
+
+                    else:
+                        # b is fixed by overlap state
+                        b = b_fixed
+                        for a in (0, 1):
+                            if flip[ta, tb, cp_idx, a, b]:
+                                avalanche[input_bit, j] += p_in * 0.5
+
+                            cp_next = int(next_cp[ta, tb, cp_idx, a, b])
+                            if do_write and a == 1:
+                                dp_next[int(next_state_if_write_vec[state]), cp_next] += p_in * 0.5
+                            else:
+                                dp_next[state, cp_next] += p_in * 0.5
 
             dp, dp_next = dp_next, dp
 

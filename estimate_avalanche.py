@@ -17,7 +17,7 @@ AvalancheArray: TypeAlias = npt.NDArray[np.float64]
 AvalancheArrayMeanP95: TypeAlias = Tuple[AvalancheArray, AvalancheArray, AvalancheArray]
 Inputs: TypeAlias = npt.NDArray[np.uint64]  # 1D array of uint64 values
 
-NBITS = 8
+NBITS = 64
 
 pool = ThreadPoolExecutor()
 
@@ -1144,12 +1144,192 @@ def exact_model_multiply(constant: int) -> AvalancheArray:
 
 
 def estimate_multiply(constant: int) -> AvalancheArray:
-    return identity(NBITS)
+    """Estimate avalanche matrix for y = x * constant (mod 2**NBITS).
+
+    Goal
+    - Return a NBITS×NBITS matrix A where A[i,j] = P( output bit j flips | input bit i flips )
+      under uniform random NBITS-bit input x.
+
+    Derivation (single-bit input flip)
+    Consider flipping input bit i: x' = x XOR 2**i. Write:
+        x = u + b*2**i,  where u has bit i cleared and b ∈ {0,1}.
+    Then x' corresponds to the same u with b' = 1-b.
+
+    Let c be the multiplier ("constant") and define the additive delta:
+        K = (c << i) mod 2**NBITS.
+    Define the partial product:
+        s = (c * u) mod 2**NBITS.
+    Then the paired outputs are:
+        y  = s + b*K  (mod 2**NBITS)
+        y' = s + (1-b)*K  (mod 2**NBITS)
+    Therefore, for the paired sample (u,b), the output XOR-difference is:
+        y XOR y' = (s) XOR (s + K).
+    So the avalanche row i reduces to “bit-flip probabilities when adding a fixed
+    constant K to the random variable s”.
+
+    Why this is not the same as plain addition-by-constant
+    A tempting (but wrong) simplification is to treat s as uniform whenever c is
+    odd. While multiplication by an odd c is a permutation, here u is NOT uniform:
+    it is uniform conditioned on u[i]=0 (a half-space). That conditioning biases
+    the distribution of s[i], and that bias affects the carry into bit i+1 when
+    computing s + K.
+
+    What we compute exactly
+    For odd multipliers, the only carry state that depends on that bias is the
+    initial carry entering bit i+1:
+        carry_{i+1} = 1  iff  (K[i]=1 and s[i]=1).
+    For bits above i, the usual carry recurrence for adding a constant to a
+    uniform word applies exactly.
+
+    The remaining problem is therefore to compute, for each i:
+        p_i = P(s[i] = 1 | u[i]=0),  where s = (c*u) mod 2**(i+1).
+    We compute p_i exactly via a counting formula based on the classic
+    floor-sum routine:
+        sum_{k=0}^{N-1} floor((a*k + b)/m)  in O(log m).
+    This avoids any exponential enumeration and keeps total work O(NBITS**2).
+
+    Even multipliers
+    If c has t trailing zeros (c = 2**t * c_odd), then y is simply the
+    (NBITS-t)-bit odd-multiply result shifted left by t, so we reduce to the odd
+    case and embed the result with a column-shift.
+
+    Complexity
+    - Exact for all constants.
+    - Time: O(NBITS**2) per constant.
+    - Space: O(NBITS**2) for the returned matrix.
+    """
+
+    def _floor_sum(count: int, modulus: int, coef: int, offset: int) -> int:
+        """Compute ∑_{k=0}^{count-1} floor((coef*k + offset)/modulus) in O(log modulus)."""
+        total = 0
+        while True:
+            if coef >= modulus:
+                total += (count - 1) * count * (coef // modulus) // 2
+                coef %= modulus
+            if offset >= modulus:
+                total += count * (offset // modulus)
+                offset %= modulus
+
+            y_max = coef * count + offset
+            if y_max < modulus:
+                break
+            count = y_max // modulus
+            offset = y_max % modulus
+            modulus, coef = coef, modulus
+        return total
+
+    def _prob_product_bit_one_given_input_bit_zero(odd_multiplier: int, bit_index: int) -> float:
+        """Return P( (odd_multiplier * X)[bit_index] == 1 | X[bit_index] = 0 ).
+
+        Let N = 2**bit_index. Conditioning X[bit_index]=0 means X ranges uniformly
+        over {0,1,...,N-1} when considering only the low (bit_index+1) bits.
+
+        We want the fraction of k in [0,N) such that the top bit of
+            (odd_multiplier * k) mod 2**(bit_index+1)
+        is 1.
+
+        Let q_k = floor((c*k)/N). For k in [0,N), the value (c*k) mod 2N is either
+        in [0,N) (top bit 0) or [N,2N) (top bit 1). Exactly which side it lands on
+        is determined by the parity of q_k:
+            top_bit( (c*k) mod 2N ) == (q_k mod 2).
+
+        So we need count_ones = Σ (q_k mod 2). Use:
+            (q mod 2) = q - 2*floor(q/2)
+        and floor(floor(x)/2) == floor(x/2) to rewrite:
+            count_ones
+              = Σ floor(c*k/N) - 2*Σ floor(c*k/(2N)).
+        Both sums are computed by _floor_sum.
+        """
+        half_range = 1 << bit_index
+        full_range = 2 * half_range
+
+        # Only c mod 2N affects the bit_index-th output bit.
+        c_mod = odd_multiplier & (full_range - 1)
+        sum_floor_half = _floor_sum(half_range, half_range, c_mod, 0)
+        sum_floor_full = _floor_sum(half_range, full_range, c_mod, 0)
+        count_ones = sum_floor_half - 2 * sum_floor_full
+        return float(count_ones) / float(half_range)
+
+    def _product_bit_one_probs_given_input_bit_zero(odd_multiplier: int, nbits: int) -> npt.NDArray[np.float64]:
+        probs = np.zeros(nbits, dtype=np.float64)
+        for bit_index in range(nbits):
+            probs[bit_index] = _prob_product_bit_one_given_input_bit_zero(odd_multiplier, bit_index)
+        return probs
+
+    def _count_trailing_zeros(x: int, *, nbits: int) -> int:
+        if x == 0:
+            return nbits
+        tz = 0
+        while (x & 1) == 0 and tz < nbits:
+            tz += 1
+            x >>= 1
+        return tz
+
+    def _estimate_for_odd_multiplier(odd_multiplier: int, nbits: int) -> AvalancheArray:
+        mask = (1 << nbits) - 1
+        multiplier = odd_multiplier & mask
+        if multiplier == 0:
+            return np.zeros((nbits, nbits), dtype=np.float64)
+        if (multiplier & 1) == 0:
+            raise ValueError("_estimate_for_odd_multiplier requires an odd multiplier")
+
+        prob_product_bit_one_given_xi0 = _product_bit_one_probs_given_input_bit_zero(multiplier, nbits)
+        avalanche_local = np.zeros((nbits, nbits), dtype=np.float64)
+
+        for flip_bit in range(nbits):
+            delta = (multiplier << flip_bit) & mask
+
+            # Bits below flip_bit are unaffected (T-function property).
+            if flip_bit > 0:
+                avalanche_local[flip_bit, :flip_bit] = 0.0
+
+            # Carry into bit flip_bit is 0 because delta has zeros below flip_bit.
+            delta_bit = (delta >> flip_bit) & 1
+            avalanche_local[flip_bit, flip_bit] = float(delta_bit)
+
+            # carry_{flip_bit+1} = 1 iff delta[flip_bit]=1 and s[flip_bit]=1.
+            carry_prob = prob_product_bit_one_given_xi0[flip_bit] if delta_bit == 1 else 0.0
+
+            for out_bit in range(flip_bit + 1, nbits):
+                delta_out_bit = (delta >> out_bit) & 1
+                avalanche_local[flip_bit, out_bit] = carry_prob if delta_out_bit == 0 else (1.0 - carry_prob)
+
+                # For out_bit >= flip_bit+1, s[out_bit] is unbiased/independent (odd multiplier),
+                # so the standard full-adder carry recurrence applies exactly.
+                carry_prob = (0.5 * carry_prob) if delta_out_bit == 0 else (0.5 + 0.5 * carry_prob)
+
+        return avalanche_local
+
+    mask_full = (1 << NBITS) - 1
+    constant &= mask_full
+    if constant == 0:
+        return np.zeros((NBITS, NBITS), dtype=np.float64)
+
+    out_shift = _count_trailing_zeros(constant, nbits=NBITS)
+    if out_shift >= NBITS:
+        return np.zeros((NBITS, NBITS), dtype=np.float64)
+
+    if out_shift == 0:
+        return _estimate_for_odd_multiplier(constant, NBITS)
+
+    effective_bits = NBITS - out_shift
+    odd_multiplier = constant >> out_shift
+    reduced = _estimate_for_odd_multiplier(odd_multiplier, effective_bits) if odd_multiplier != 0 else np.zeros(
+        (effective_bits, effective_bits), dtype=np.float64
+    )
+
+    avalanche = np.zeros((NBITS, NBITS), dtype=np.float64)
+    if effective_bits == 0:
+        return avalanche
+
+    # Output is shifted left by out_shift: columns shift upward.
+    avalanche[:effective_bits, out_shift:] = reduced
+    return avalanche
 
 def test_multiply(constant: int, n: int) -> tuple[float, float, float, float, float]:
     """Test the avalanche effect of an XOR operation with a constant."""
     def op_func(inputs: Inputs) -> Inputs:
-        return inputs * constant
+        return inputs * np.uint64(constant)
 
     estimated = estimate_multiply(constant)
     actual, low_actual, high_actual = calculate_avalanche(op_func, n)
@@ -1169,15 +1349,78 @@ def test_multiply(constant: int, n: int) -> tuple[float, float, float, float, fl
 
 
 def main() -> None:
+    global NBITS
+    for arg in sys.argv[1:]:
+        if arg.startswith("--nbits="):
+            NBITS = int(arg.split("=", 1)[1])
+
+    # Exact verification for small widths.
+    if NBITS <= 16:
+        mask = (1 << NBITS) - 1
+        constants_to_check: list[int] = []
+        constants_to_check.extend(
+            [
+                0x00,
+                0x01,
+                0x02,
+                0x03,
+                0x05,
+                0x07,
+                0x09,
+                0x0F,
+                0x11,
+                0x33,
+                0x55,
+                0x7F,
+                0x81,
+                0xA5,
+                0xC3,
+                0xFF,
+            ]
+        )
+        constants_to_check.extend([splitmix(s) for s in range(64)])
+        for c in constants_to_check:
+            c &= mask
+            est = estimate_multiply(c)
+            ex = exact_model_multiply(c)
+            if not np.allclose(est, ex, rtol=0.0, atol=1e-12):
+                diff = float(np.max(np.abs(est - ex)))
+                raise AssertionError(
+                    f"estimate_multiply mismatch for NBITS={NBITS}, constant={c:#x} (max abs diff={diff})."
+                )
+
     print("\nRunning operation tests...")
-    n = 100000
-    accuracies = list()
+    n = 50000 if NBITS >= 32 else 100000
+    mask = (1 << NBITS) - 1
+
+    if NBITS >= 32:
+        # Edge + random constants for 64-bit style sampling validation.
+        constants: list[int] = [
+            0,
+            1,
+            2,
+            3,
+            5,
+            (1 << (NBITS - 1)) | 1,
+            (1 << (NBITS - 1)) - 1,
+            (1 << (NBITS // 2)) + 1,
+            0x5555555555555555 & mask,
+            0xAAAAAAAAAAAAAAAA & mask,
+            0x0123456789ABCDEF & mask,
+            0xFEDCBA9876543211 & mask,
+        ]
+        constants.extend([(splitmix(s) & mask) | 1 for s in range(8)])
+    else:
+        constants = [(splitmix(s) & mask) for s in range(NBITS)]
+
+    accuracies = []
     z_means: list[float] = []
     z_rms: list[float] = []
     z_max_abs: list[float] = []
     z_frac_gt_3: list[float] = []
-    for x in range(NBITS):
-        constant = splitmix(x) & ((1 << NBITS) - 1) | 0x01
+
+    for constant in constants:
+        constant &= mask
         accuracy, mean_z, rms_z, max_abs_z, frac_abs_z_gt_3 = test_multiply(constant, n)
         accuracies.append(accuracy)
         z_means.append(float(mean_z))
@@ -1185,7 +1428,7 @@ def main() -> None:
         z_max_abs.append(float(max_abs_z))
         z_frac_gt_3.append(float(frac_abs_z_gt_3))
         print(
-            f"op with {x:#018x}: {accuracy:.2f}% within 95% CI over {n} samples "
+            f"mul const={constant:#018x}: {accuracy:.2f}% within 95% CI over {n} samples "
             f"(mean z={mean_z:.2f}, rms z={rms_z:.2f}, max |z|={max_abs_z:.2f}, |z|>3={100.0*frac_abs_z_gt_3:.2f}%)."
         )
 
